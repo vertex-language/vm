@@ -1,0 +1,308 @@
+package vm
+
+import (
+    "fs"
+    "io"
+    "sync"
+    "time"
+    "vm/boot"
+    "vm/chipset"
+    "vm/device"
+    "vm/disk"
+    "vm/disk/qcow2"
+    "vm/disk/vhdx"
+    "vm/hypervisor"
+)
+
+/// The status returned when a virtual machine stops execution.
+public enum ExitStatus: Equatable, CustomStringConvertible {
+    case poweredOff
+    case reset
+    case crashed(string)
+
+    public var description: string {
+        switch self {
+        case .poweredOff: return "powered off"
+        case .reset: return "reset requested"
+        case .crashed(let reason): return "crashed: \(reason)"
+        }
+    }
+}
+
+/// A running virtual machine.
+public final class Machine: PsciController {
+    public let Config: Config
+    public let Partition: hypervisor.Partition
+    public let Ram: GuestRam
+    public let Wired: WiredDevices
+
+    public var ConsoleUart: chipset.Pl011? { Wired.ConsoleUart }
+
+    var psci: PsciHandler? = nil
+    var vcpus: [VcpuWorker] = []
+    var running = false
+    var exitStatus: ExitStatus = .poweredOff
+    var exitRequested = false
+    let lock = sync.Mutex()
+    var closed = false
+
+    init(
+        config: Config,
+        partition: hypervisor.Partition,
+        ram: GuestRam,
+        wired: WiredDevices
+    ) {
+        self.Config = config
+        self.Partition = partition
+        self.Ram = ram
+        self.Wired = wired
+    }
+
+    /// Creates and configures a new virtual machine from `cfg`.
+    public static func Create(_ cfg: Config, consoleWriter: any io.AsyncWriter = StdioWriter()) throws -> Machine {
+        if cfg.Cpus < 1 {
+            throw VmError.invalidConfig("vCPU count must be at least 1")
+        }
+        if cfg.Memory < (64 << 20) {
+            throw VmError.invalidConfig("memory must be at least 64 MiB")
+        }
+
+        let caps = try? hypervisor.Probe()
+        if caps == nil {
+            throw VmError.hypervisorUnavailable("hypervisor probe failed or not supported on this host")
+        }
+
+        // 1. Allocate guest physical RAM
+        let ramBase = PlatformArm64.RamBase
+        let ram = try GuestRam(base: ramBase, size: cfg.Memory)
+
+        // 2. Create the hypervisor partition and map RAM
+        let partition = try hypervisor.Create(vcpus: cfg.Cpus)
+        try ram.Map(into: partition)
+
+        // 3. Create the in-kernel GICv3 interrupt controller on arm64
+        try partition.CreateIrqChip(
+            distributor: PlatformArm64.GicDistBase,
+            redistributor: PlatformArm64.GicRedistBase
+        )
+
+        // 4. Wire platform devices (UART, RTC, VirtIO)
+        let wired = try WirePlatform(
+            cfg: cfg,
+            partition: partition,
+            ram: ram,
+            consoleWriter: consoleWriter
+        )
+
+        let machine = Machine(
+            config: cfg,
+            partition: partition,
+            ram: ram,
+            wired: wired
+        )
+        let psci = PsciHandler(controller: machine)
+        machine.psci = psci
+
+        // 5. Configure boot loader
+        var bootPc: uint64 = 0
+        var bootX0: uint64 = 0
+
+        if let b = cfg.Boot {
+            switch b {
+            case .linux(let kernel, let initrd, let cmdline):
+                let plan = try boot.LinuxArm64(
+                    kernel: kernel,
+                    initrd: initrd,
+                    cmdline: cmdline,
+                    ram: ram.Range
+                )
+
+                // Write kernel and initrd into guest memory
+                for load in plan.Loads {
+                    try ram.Memory.Write(load.Address, load.Bytes)
+                }
+
+                // Generate and write Device Tree (DTB)
+                let dtb = PlatformArm64.BuildFdt(
+                    vcpus: cfg.Cpus,
+                    ram: ram.Range,
+                    initrd: plan.Initrd,
+                    cmdline: plan.Cmdline,
+                    virtioCount: wired.VirtioCount
+                )
+                if let dtbAddr = plan.DeviceTree {
+                    try ram.Memory.Write(dtbAddr, dtb)
+                }
+
+                switch plan.Entry {
+                case .arm64(let pc, let x0):
+                    bootPc = pc
+                    bootX0 = x0
+                default:
+                    throw VmError.bootFailed("unsupported entry mode for arm64")
+                }
+
+            case .efi(let firmware, _):
+                // For UEFI, load firmware at reset or flash base
+                bootPc = PlatformArm64.RamBase
+                try ram.Memory.Write(device.GuestAddress(bootPc), firmware)
+            }
+        }
+
+        // 6. Create vCPUs
+        for i in 0..<cfg.Cpus {
+            let isBoot = (i == 0)
+            let worker = VcpuWorker(
+                id: i,
+                partition: partition,
+                mmioBus: wired.MmioBus,
+                pioBus: wired.PioBus,
+                psci: psci,
+                isBootCpu: isBoot,
+                entryPc: isBoot ? bootPc : 0,
+                entryX0: isBoot ? bootX0 : 0
+            )
+            machine.vcpus.append(worker)
+        }
+
+        return machine
+    }
+
+    /// Starts execution of the virtual machine.
+    public func Start() throws {
+        lock.withLock {
+            if running { return }
+            running = true
+            exitRequested = false
+        }
+        // Start the boot vCPU (vCPU 0). Secondary CPUs are powered on via PSCI.
+        vcpus[0].Start()
+    }
+
+    /// Stops all vCPUs cleanly.
+    public func Terminate() {
+        lock.withLock {
+            exitRequested = true
+            exitStatus = .poweredOff
+        }
+        for v in vcpus {
+            v.Stop()
+        }
+    }
+
+    /// Kills the virtual machine immediately.
+    public func Kill() {
+        Terminate()
+    }
+
+    /// Awaits until the virtual machine shuts down, resets, or crashes.
+    public func Wait() async throws -> ExitStatus {
+        while true {
+            let done = lock.withLock { exitRequested }
+            if done { break }
+            try? await Task.sleep(nanoseconds: 10_000_000) // 10ms poll
+        }
+        // Join all vCPU threads
+        for v in vcpus {
+            v.Join()
+        }
+        return lock.withLock { exitStatus }
+    }
+
+    public func Close() {
+        if closed { return }
+        closed = true
+        Terminate()
+        for v in vcpus {
+            v.Join()
+        }
+        Partition.Close()
+    }
+
+    deinit {
+        Close()
+    }
+
+    // MARK: - PsciController Protocol
+
+    public func StartVcpu(mpidr: uint64, entry: uint64, context: uint64) -> int64 {
+        let id = int(mpidr & 0xff)
+        if id < 0 || id >= vcpus.count {
+            return psciInvalidParams
+        }
+        let v = vcpus[id]
+        if v.running {
+            return psciAlreadyOn
+        }
+        v.EntryPc = entry
+        v.EntryX0 = context
+        v.EntryPstate = 0x3c5
+        v.Start()
+        return psciSuccess
+    }
+
+    public func StopVcpu(_ id: int) {
+        if id >= 0 && id < vcpus.count {
+            vcpus[id].Stop()
+        }
+    }
+
+    public func VcpuAffinity(mpidr: uint64) -> int64 {
+        let id = int(mpidr & 0xff)
+        if id < 0 || id >= vcpus.count {
+            return 1 // OFF
+        }
+        return vcpus[id].running ? 0 : 1 // 0 = ON, 1 = OFF
+    }
+
+    public func RequestShutdown() {
+        lock.withLock {
+            exitRequested = true
+            exitStatus = .poweredOff
+        }
+        for v in vcpus {
+            v.Stop()
+        }
+    }
+
+    public func RequestReset() {
+        lock.withLock {
+            exitRequested = true
+            exitStatus = .reset
+        }
+        for v in vcpus {
+            v.Stop()
+        }
+    }
+}
+
+/// Convenience function to create and open a disk image from a file path.
+public func OpenDisk(_ path: fs.Path, readOnly: bool = false) async throws -> any disk.Image {
+    var opt = fs.OpenOptions()
+    opt.Read = true
+    opt.Write = !readOnly
+    let f = try fs.Open(path, opt)
+    defer { try? f.Close() }
+    var magic = [uint8](repeating: 0, count: 8)
+    _ = try? f.Read(into: &magic)
+
+    // QCOW2 magic: "QFI\xfb"
+    if magic.count >= 4 && magic[0] == 0x51 && magic[1] == 0x46 && magic[2] == 0x49 && magic[3] == 0xfb {
+        let file = try fs.Open(path, opt)
+        return try qcow2.Open(file)
+    }
+
+    // VHDX magic: "vhdxfile"
+    let magicStr = string(decoding: magic, as: UTF8.self)
+    if magicStr.starts(with: "vhdx") {
+        let file = try fs.Open(path, opt)
+        return try vhdx.Open(file)
+    }
+
+    return try disk.OpenRaw(path, readOnly: readOnly)
+}
+
+/// Entry point to create a VM: `vm.Create(cfg)`.
+public func Create(_ cfg: Config, consoleWriter: any io.AsyncWriter = StdioWriter()) throws -> Machine {
+    try Machine.Create(cfg, consoleWriter: consoleWriter)
+}

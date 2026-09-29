@@ -1,0 +1,15 @@
+.DS_Store
+
+# Build output.
+.build/
+
+# Local environment variables and secrets.
+.env
+*.env
+
+# Binaries and local test outputs
+vm-run
+boot-test
+disk-tool
+*.raw
+
