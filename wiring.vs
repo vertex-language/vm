@@ -73,6 +73,9 @@ public struct WiredDevices {
     public var PioBus = device.PioBus()
     public var ConsoleUart: chipset.Pl011? = nil
     public var VirtioTransports: [virtio.MmioTransport] = []
+    public var KeyboardInput: virtio.Input? = nil
+    public var TabletInput: virtio.Input? = nil
+    public var Rng: virtio.Rng? = nil
     public var VirtioCount: int = 0
 }
 
@@ -90,6 +93,7 @@ public func WirePlatform(
     let uart = chipset.Pl011(output: consoleWriter, irq: uartIrq)
     try wired.MmioBus.Insert(uart, at: device.Range(base: PlatformArm64.UartBase, count: PlatformArm64.UartSize))
     wired.ConsoleUart = uart
+
     // 2. Real-Time Clock
     let rtcIrq = GicIrq(partition: partition, line: PlatformArm64.RtcIrq)
     let rtc = chipset.Pl031(irq: rtcIrq)
@@ -119,6 +123,42 @@ public func WirePlatform(
         wired.VirtioTransports.append(transport)
         slot += 1
     }
+
+    // 5. Input devices (keyboard and tablet when display is enabled)
+    if cfg.Display.Enabled {
+        // 5a. Keyboard input device
+        let kbd = virtio.Input(.keyboard)
+        let irqLineKbd = PlatformArm64.VirtioIrqBase + uint32(slot)
+        let irqKbd = GicIrq(partition: partition, line: irqLineKbd)
+        let transportKbd = virtio.MmioTransport(kbd, memory: ram.Memory, irq: irqKbd)
+        let addrKbd = PlatformArm64.VirtioMmioBase + uint64(slot) * PlatformArm64.VirtioMmioStride
+        try wired.MmioBus.Insert(transportKbd, at: device.Range(base: addrKbd, count: PlatformArm64.VirtioMmioSize))
+        wired.VirtioTransports.append(transportKbd)
+        wired.KeyboardInput = kbd
+        slot += 1
+
+        // 5b. Tablet input device
+        let tablet = virtio.Input(.tablet)
+        let irqLineTablet = PlatformArm64.VirtioIrqBase + uint32(slot)
+        let irqTablet = GicIrq(partition: partition, line: irqLineTablet)
+        let transportTablet = virtio.MmioTransport(tablet, memory: ram.Memory, irq: irqTablet)
+        let addrTablet = PlatformArm64.VirtioMmioBase + uint64(slot) * PlatformArm64.VirtioMmioStride
+        try wired.MmioBus.Insert(transportTablet, at: device.Range(base: addrTablet, count: PlatformArm64.VirtioMmioSize))
+        wired.VirtioTransports.append(transportTablet)
+        wired.TabletInput = tablet
+        slot += 1
+    }
+
+    // 6. Entropy / RNG device
+    let rng = virtio.Rng()
+    let irqLineRng = PlatformArm64.VirtioIrqBase + uint32(slot)
+    let irqRng = GicIrq(partition: partition, line: irqLineRng)
+    let transportRng = virtio.MmioTransport(rng, memory: ram.Memory, irq: irqRng)
+    let addrRng = PlatformArm64.VirtioMmioBase + uint64(slot) * PlatformArm64.VirtioMmioStride
+    try wired.MmioBus.Insert(transportRng, at: device.Range(base: addrRng, count: PlatformArm64.VirtioMmioSize))
+    wired.VirtioTransports.append(transportRng)
+    wired.Rng = rng
+    slot += 1
 
     wired.VirtioCount = slot
     return wired

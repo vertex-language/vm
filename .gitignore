@@ -8,8 +8,11 @@
 *.env
 
 # Binaries and local test outputs
-vm-run
-boot-test
-disk-tool
+/vm-run
+/boot-test
+/disk-tool
 *.raw
 
+# Local downloaded test media
+testdata/debian/
+testdata/ubuntu/

@@ -36,7 +36,7 @@ public final class MmioTransport: device.Mmio, Notifier {
     }
 
     public func Read(offset: uint64, size: uint8) -> uint64 {
-        lock.withLock {
+        return lock.withLock {
             if offset >= 0x100 {
                 return dev.ReadConfig(offset: offset - 0x100, size: size)
             }

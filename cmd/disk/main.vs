@@ -4,6 +4,7 @@ import (
     "fs"
     "os/process"
     "vm"
+    "vm/boot"
     "vm/disk"
     "vm/disk/qcow2"
 )
@@ -16,6 +17,10 @@ Commands:
   info <path>                   Show disk image information
   create <path> <size>          Create a new raw disk image (e.g., 10G, 512M)
   convert <source> <dest>       Convert / copy a disk image to a raw image
+  list-iso <iso> [dir]          List files and directories in an ISO image
+  extract <iso> <file> <dest>   Extract a file from an ISO image to local disk
+  extract-kernel <iso> [dest]   Extract and unpack boot kernel to a raw ARM64 Image
+  boot-files <iso>              Detect bootable kernel and initrd in an ISO image
 """)
 }
 
@@ -76,7 +81,32 @@ func doInfo(_ pathStr: string) async throws {
         _ = try? f.Read(into: &magic, at: 0)
     }
 
-    if magic.count >= 4 && magic[0] == 0x51 && magic[1] == 0x46 && magic[2] == 0x49 && magic[3] == 0xfb {
+    // Check if ISO 9660
+    var isoInfo: disk.IsoInfo? = nil
+    if let f = try? fs.Open(p) {
+        defer { try? f.Close() }
+        if let info = (try? disk.ReadIsoInfo(from: f)) ?? nil {
+            isoInfo = info
+        }
+    }
+
+    if let iso = isoInfo {
+        print("Format:         ISO 9660 (CD-ROM / DVD)")
+        if !iso.VolumeId.isEmpty {
+            print("Volume ID:      \(iso.VolumeId)")
+        }
+        if !iso.SystemId.isEmpty {
+            print("System ID:      \(iso.SystemId)")
+        }
+        if !iso.Publisher.isEmpty {
+            print("Publisher:      \(iso.Publisher)")
+        }
+        if !iso.Application.isEmpty {
+            print("Application:    \(iso.Application)")
+        }
+        print("Block size:     \(iso.LogicalBlockSize) bytes")
+        print("Bootable:       \(iso.IsBootable ? "yes (El Torito)" : "no")")
+    } else if magic.count >= 4 && magic[0] == 0x51 && magic[1] == 0x46 && magic[2] == 0x49 && magic[3] == 0xfb {
         print("Format:         QCOW2")
         if let hdr = try? qcow2.ParseHeader(magic) {
             print("QCOW2 version:  \(hdr.Version)")
@@ -134,6 +164,120 @@ func doConvert(_ srcStr: string, _ dstStr: string) async throws {
     print("Conversion complete: \(dstStr) written successfully.")
 }
 
+func doListIso(_ pathStr: string, _ subDir: string = "") async throws {
+    let p = fs.Path(pathStr)
+    let file = try fs.Open(p)
+    defer { try? file.Close() }
+
+    guard let info = try disk.ReadIsoInfo(from: file) else {
+        print("Error: \(pathStr) is not a valid ISO 9660 image.")
+        return
+    }
+
+    var targetLba = info.RootLba
+    var targetLen = info.RootLength
+    var displayDir = "/"
+    if !subDir.isEmpty && subDir != "/" {
+        displayDir = subDir
+        guard let entry = try disk.FindIsoEntry(from: file, rootLba: info.RootLba, rootLength: info.RootLength, path: subDir) else {
+            print("Error: Directory '\(subDir)' not found in ISO.")
+            return
+        }
+        if !entry.IsDirectory {
+            print("Error: '\(subDir)' is a file, not a directory.")
+            return
+        }
+        targetLba = entry.Lba
+        targetLen = entry.Size
+    }
+
+    let entries = try disk.ReadIsoDirectory(from: file, at: targetLba, length: targetLen)
+    print("Contents of ISO '\(info.VolumeId)' at \(displayDir):")
+    print("----------------------------------------------------------------------")
+    print("Type  Size          LBA      Name")
+    print("----------------------------------------------------------------------")
+    for e in entries {
+        let typeStr = e.IsDirectory ? "<DIR>" : "     "
+        print("\(typeStr) \(e.Size) bytes  (LBA \(e.Lba))  \(e.Name)")
+    }
+    print("----------------------------------------------------------------------")
+    print("Total: \(entries.count) entries")
+}
+
+func doExtract(_ isoStr: string, _ entryPath: string, _ destStr: string) async throws {
+    let isoFile = try fs.Open(fs.Path(isoStr))
+    defer { try? isoFile.Close() }
+
+    guard let info = try disk.ReadIsoInfo(from: isoFile) else {
+        print("Error: \(isoStr) is not a valid ISO 9660 image.")
+        return
+    }
+
+    guard let entry = try disk.FindIsoEntry(from: isoFile, rootLba: info.RootLba, rootLength: info.RootLength, path: entryPath) else {
+        print("Error: File '\(entryPath)' not found in ISO.")
+        return
+    }
+
+    if entry.IsDirectory {
+        print("Error: '\(entryPath)' is a directory, not a file.")
+        return
+    }
+
+    print("Extracting \(entryPath) (\(entry.Size) bytes) to \(destStr)...")
+    try disk.ExtractIsoFile(from: isoFile, entry: entry, to: fs.Path(destStr))
+    print("Extraction complete: \(destStr)")
+}
+
+func doBootFiles(_ isoStr: string) async throws {
+    let isoFile = try fs.Open(fs.Path(isoStr))
+    defer { try? isoFile.Close() }
+
+    guard let info = try disk.ReadIsoInfo(from: isoFile) else {
+        print("Error: \(isoStr) is not a valid ISO 9660 image.")
+        return
+    }
+
+    guard let boot = try disk.FindIsoBootFiles(from: isoFile, rootLba: info.RootLba, rootLength: info.RootLength) else {
+        print("No standard Linux boot files detected in ISO.")
+        return
+    }
+
+    print("ISO Boot Configuration for: \(info.VolumeId)")
+    print("  Kernel:     \(boot.KernelPath) (\(boot.Kernel.Size) bytes, LBA \(boot.Kernel.Lba))")
+    if let rd = boot.Initrd {
+        print("  Initrd:     \(boot.InitrdPath ?? "") (\(rd.Size) bytes, LBA \(rd.Lba))")
+    }
+    print("  Cmdline:    \(boot.RecommendedCmdline)")
+}
+
+func doExtractKernel(_ isoStr: string, _ destStr: string) async throws {
+    let isoFile = try fs.Open(fs.Path(isoStr))
+    defer { try? isoFile.Close() }
+
+    guard let info = try disk.ReadIsoInfo(from: isoFile) else {
+        print("Error: \(isoStr) is not a valid ISO 9660 image.")
+        return
+    }
+
+    guard let bootFiles = try disk.FindIsoBootFiles(from: isoFile, rootLba: info.RootLba, rootLength: info.RootLength) else {
+        print("No bootable kernel detected in ISO.")
+        return
+    }
+
+    print("Found kernel: \(bootFiles.KernelPath) (\(bootFiles.Kernel.Size) bytes)")
+    print("Reading kernel bytes from ISO...")
+    let rawBytes = try disk.ReadIsoFile(from: isoFile, entry: bootFiles.Kernel)
+    let fmt = boot.DetectKernelFormat(rawBytes)
+    print("Detected kernel format: \(fmt)")
+    print("Unpacking to raw ARM64 Image...")
+    let unpacked = try await boot.UnpackKernel(rawBytes)
+
+    let outFile = try fs.Create(fs.Path(destStr))
+    defer { try? outFile.Close() }
+    try outFile.Write(unpacked, at: 0)
+    print("Successfully wrote \(unpacked.count) bytes to \(destStr) (ARM64 Image)")
+}
+
 public func main() async throws {
     let args = process.Args
     if args.count < 2 {
@@ -149,6 +293,36 @@ public func main() async throws {
             return
         }
         try await doInfo(args[2])
+
+    case "list-iso":
+        if args.count < 3 {
+            print("Usage: disk list-iso <iso-path> [subdir]")
+            return
+        }
+        let subDir = args.count >= 4 ? args[3] : ""
+        try await doListIso(args[2], subDir)
+
+    case "extract":
+        if args.count < 5 {
+            print("Usage: disk extract <iso-path> <file-in-iso> <dest-path>")
+            return
+        }
+        try await doExtract(args[2], args[3], args[4])
+
+    case "extract-kernel":
+        if args.count < 3 {
+            print("Usage: disk extract-kernel <iso-path> [dest-path]")
+            return
+        }
+        let dest = args.count >= 4 ? args[3] : "Image"
+        try await doExtractKernel(args[2], dest)
+
+    case "boot-files":
+        if args.count < 3 {
+            print("Usage: disk boot-files <iso-path>")
+            return
+        }
+        try await doBootFiles(args[2])
 
     case "create":
         if args.count < 4 {

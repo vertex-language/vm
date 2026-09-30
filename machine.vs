@@ -2,6 +2,7 @@ package vm
 
 import (
     "fs"
+    "fs/mmap"
     "io"
     "sync"
     "time"
@@ -11,7 +12,9 @@ import (
     "vm/disk"
     "vm/disk/qcow2"
     "vm/disk/vhdx"
+    "vm/display"
     "vm/hypervisor"
+    "vm/virtio"
 )
 
 /// The status returned when a virtual machine stops execution.
@@ -37,6 +40,10 @@ public final class Machine: PsciController {
     public let Wired: WiredDevices
 
     public var ConsoleUart: chipset.Pl011? { Wired.ConsoleUart }
+    public var KeyboardInput: virtio.Input? { Wired.KeyboardInput }
+    public var TabletInput: virtio.Input? { Wired.TabletInput }
+    public var Framebuffer: display.Framebuffer? = nil
+    var fbMapping: mmap.Mapping? = nil
 
     var psci: PsciHandler? = nil
     var vcpus: [VcpuWorker] = []
@@ -103,6 +110,37 @@ public final class Machine: PsciController {
         let psci = PsciHandler(controller: machine)
         machine.psci = psci
 
+        // 4b. Framebuffer setup (if enabled)
+        var fbConfig: FramebufferConfig? = nil
+        if cfg.Display.Enabled {
+            let width = cfg.Display.Width
+            let height = cfg.Display.Height
+            let cfgFb = FramebufferConfig(
+                base: PlatformArm64.FbBase,
+                width: width,
+                height: height,
+                format: "a8r8g8b8"
+            )
+            fbConfig = cfgFb
+            let mapping = try mmap.Anonymous(int(PlatformArm64.FbSize))
+            guard let ptr = mapping.RawPointer else {
+                throw VmError.memoryAllocationFailed("failed to allocate \(PlatformArm64.FbSize) bytes for framebuffer")
+            }
+            try partition.Map(guest: PlatformArm64.FbBase, host: ptr, count: PlatformArm64.FbSize, access: .all)
+            let region = device.Region(guest: device.GuestAddress(PlatformArm64.FbBase), count: PlatformArm64.FbSize, host: ptr)
+            let fbMem = device.GuestMemory([region])
+            let fb = display.Framebuffer(memory: fbMem, hostPointer: ptr)
+            fb.Configure(
+                address: device.GuestAddress(PlatformArm64.FbBase),
+                width: width,
+                height: height,
+                stride: width * 4,
+                format: .xrgb8888
+            )
+            machine.Framebuffer = fb
+            machine.fbMapping = mapping
+        }
+
         // 5. Configure boot loader
         var bootPc: uint64 = 0
         var bootX0: uint64 = 0
@@ -128,7 +166,8 @@ public final class Machine: PsciController {
                     ram: ram.Range,
                     initrd: plan.Initrd,
                     cmdline: plan.Cmdline,
-                    virtioCount: wired.VirtioCount
+                    virtioCount: wired.VirtioCount,
+                    framebuffer: fbConfig
                 )
                 if let dtbAddr = plan.DeviceTree {
                     try ram.Memory.Write(dtbAddr, dtb)
@@ -278,9 +317,13 @@ public final class Machine: PsciController {
 
 /// Convenience function to create and open a disk image from a file path.
 public func OpenDisk(_ path: fs.Path, readOnly: bool = false) async throws -> any disk.Image {
+    let pathStr = path.Value
+    let isIsoPath = pathStr.hasSuffix(".iso") || pathStr.hasSuffix(".ISO")
+    let forceRo = readOnly || isIsoPath
+
     var opt = fs.OpenOptions()
     opt.Read = true
-    opt.Write = !readOnly
+    opt.Write = !forceRo
     let f = try fs.Open(path, opt)
     defer { try? f.Close() }
     var magic = [uint8](repeating: 0, count: 8)
@@ -299,7 +342,15 @@ public func OpenDisk(_ path: fs.Path, readOnly: bool = false) async throws -> an
         return try vhdx.Open(file)
     }
 
-    return try disk.OpenRaw(path, readOnly: readOnly)
+    // Check for ISO 9660 volume descriptor at offset 32768
+    var pvdMagic = [uint8](repeating: 0, count: 6)
+    if let n = try? f.Read(into: &pvdMagic, at: int64(disk.IsoPvdOffset)), n >= 6 {
+        if pvdMagic[0] == 1 && pvdMagic[1] == 0x43 && pvdMagic[2] == 0x44 && pvdMagic[3] == 0x30 && pvdMagic[4] == 0x30 && pvdMagic[5] == 0x31 {
+            return try disk.OpenRaw(path, readOnly: true)
+        }
+    }
+
+    return try disk.OpenRaw(path, readOnly: forceRo)
 }
 
 /// Entry point to create a VM: `vm.Create(cfg)`.

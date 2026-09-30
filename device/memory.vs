@@ -69,22 +69,27 @@ public final class GuestMemory {
     }
 
     public func Read(_ at: GuestAddress, into buffer: inout [uint8]) throws {
+        if buffer.isEmpty { return }
         let p = try Pointer(at, count: uint64(buffer.count))
         buffer.withUnsafeMutableBytes {
-            $0.baseAddress!.copyMemory(from: UnsafeRawPointer(p), byteCount: $0.count)
+            guard let base = $0.baseAddress else { return }
+            base.copyMemory(from: UnsafeRawPointer(p), byteCount: $0.count)
         }
     }
 
     public func Read(_ at: GuestAddress, count: int) throws -> [uint8] {
+        if count <= 0 { return [] }
         var b = [uint8](repeating: 0, count: count)
         try Read(at, into: &b)
         return b
     }
 
     public func Write(_ at: GuestAddress, _ bytes: borrowing [uint8]) throws {
+        if bytes.isEmpty { return }
         let p = try Pointer(at, count: uint64(bytes.count))
         bytes.withUnsafeBytes {
-            p.copyMemory(from: UnsafeRawPointer($0.baseAddress!), byteCount: $0.count)
+            guard let base = $0.baseAddress else { return }
+            p.copyMemory(from: UnsafeRawPointer(base), byteCount: $0.count)
         }
     }
 

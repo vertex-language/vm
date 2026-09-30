@@ -127,7 +127,8 @@ int32_t hvUnmap(int64_t p, uint64_t gpa, uint64_t count) noexcept {
 
 int32_t hvSetIrq(int64_t p, uint32_t line, bool level) noexcept {
     if (p != 0) return Code::invalid;
-    return fail(hv_gic_set_spi(line, level));
+    uint32_t intid = (line < 32) ? (32 + line) : line;
+    return fail(hv_gic_set_spi(intid, level));
 }
 
 int32_t hvSendMsi(int64_t p, uint64_t address, uint32_t data) noexcept {

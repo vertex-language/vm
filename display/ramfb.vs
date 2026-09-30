@@ -17,18 +17,25 @@ public final class Ramfb {
 
     /// Registers "etc/ramfb" with the machine's fw_cfg.
     public init(memory: device.GuestMemory, fwcfg: boot.FwCfg) {
-        Framebuffer = display.Framebuffer(memory: memory)
-        let fb = Framebuffer
+        let fb = display.Framebuffer(memory: memory)
+        self.Framebuffer = fb
+        Ramfb.register(fwcfg: fwcfg, fb: fb)
+    }
+
+    static func register(fwcfg: boot.FwCfg, fb: Framebuffer) {
         fwcfg.Add(boot.FwCfg.File(name: "etc/ramfb", bytes: [uint8](repeating: 0, count: 28), onWrite: { cfg in
-            if cfg.count < 28 { return }
-            let be = binary.BigEndian.self
-            let addr = be.Uint64(cfg, from: 0)
-            let fourcc = be.Uint32(cfg, from: 8)
-            let width = int(be.Uint32(cfg, from: 16))
-            let height = int(be.Uint32(cfg, from: 20))
-            let stride = int(be.Uint32(cfg, from: 24))
-            let format: Format = fourcc == Ramfb.fourccXrgb8888 ? .xrgb8888 : .xbgr8888
-            fb.Configure(address: device.GuestAddress(addr), width: width, height: height, stride: stride, format: format)
+            Ramfb.handleWrite(cfg: cfg, fb: fb)
         }))
+    }
+
+    static func handleWrite(cfg: [uint8], fb: Framebuffer) {
+        if cfg.count < 28 { return }
+        let addr = binary.BigEndian.Uint64(cfg, from: 0)
+        let fourcc = binary.BigEndian.Uint32(cfg, from: 8)
+        let width = int(binary.BigEndian.Uint32(cfg, from: 16))
+        let height = int(binary.BigEndian.Uint32(cfg, from: 20))
+        let stride = int(binary.BigEndian.Uint32(cfg, from: 24))
+        let format: Format = (fourcc == Ramfb.fourccXrgb8888) ? .xrgb8888 : .xbgr8888
+        fb.Configure(address: device.GuestAddress(addr), width: width, height: height, stride: stride, format: format)
     }
 }

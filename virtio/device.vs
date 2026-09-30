@@ -78,4 +78,4 @@ public protocol Notifier: AnyObject {
 }
 
 /// What every device's `Features` starts from.
-public let CommonFeatures: uint64 = Feature.version1 | Feature.eventIdx | Feature.indirectDescriptors
+public let CommonFeatures: uint64 = Feature.version1 | Feature.indirectDescriptors

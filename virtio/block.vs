@@ -2,6 +2,7 @@ package virtio
 
 import (
     "encoding/binary"
+    "sync"
     "vm/disk"
 )
 
@@ -12,6 +13,7 @@ public final class Block: Device {
     let image: any disk.Image
     var queues: [Queue] = []
     var notify: (any Notifier)? = nil
+    let ioLock = sync.Mutex()
 
     static let featureReadOnly: uint64 = 1 << 5
     static let featureFlush: uint64 = 1 << 9
@@ -71,13 +73,27 @@ public final class Block: Device {
     }
 
     func drain(_ q: Queue) async {
-        while let chain = try? q.Pop() {
+        while true {
+            var item: Chain? = nil
+            do {
+                try ioLock.withLock {
+                    item = try q.Pop()
+                }
+            } catch {
+                item = nil
+            }
+            guard let chain = item else { break }
+
             let (status, written) = await handle(q, chain)
             // The last writable byte of every request is its status.
-            if let last = chain.Buffers.last, last.Writable {
-                try? q.memory.Write(last.Address.Adding(uint64(last.Count) - 1), [status])
+            if let last = chain.Buffers.last, last.Writable, last.Count > 0 {
+                try? q.memory.Write(last.Address.Adding(uint64(last.Count - 1)), [status])
             }
-            if (try? q.Push(chain.Head, written: written + 1)) == true {
+            var needIntr = true
+            ioLock.withLock {
+                needIntr = (try? q.Push(chain.Head, written: written + 1)) ?? true
+            }
+            if needIntr {
                 notify?.QueueUsed(q.Index)
             }
         }
@@ -90,13 +106,17 @@ public final class Block: Device {
         }
         let type = binary.LittleEndian.Uint32(h, from: 0)
         let sector = binary.LittleEndian.Uint64(h, from: 8)
-        let data = chain.Buffers.dropFirst().dropLast()
+        let totalBuffers = chain.Buffers.count
         do {
             switch type {
             case Block.typeIn:
                 var offset = sector * 512
                 var written: uint32 = 0
-                for b in data where b.Writable {
+                var idx = 1
+                while idx < totalBuffers - 1 {
+                    let b = chain.Buffers[idx]
+                    idx += 1
+                    if !b.Writable || b.Count == 0 { continue }
                     var buf = [uint8](repeating: 0, count: int(b.Count))
                     try await image.ReadAt(offset, into: &buf)
                     try q.memory.Write(b.Address, buf)
@@ -106,7 +126,11 @@ public final class Block: Device {
                 return (Block.statusOk, written)
             case Block.typeOut:
                 var offset = sector * 512
-                for b in data where !b.Writable {
+                var idx = 1
+                while idx < totalBuffers - 1 {
+                    let b = chain.Buffers[idx]
+                    idx += 1
+                    if b.Writable || b.Count == 0 { continue }
                     let buf = try q.memory.Read(b.Address, count: int(b.Count))
                     try await image.WriteAt(offset, buf)
                     offset += uint64(b.Count)
@@ -118,14 +142,21 @@ public final class Block: Device {
             case Block.typeGetId:
                 let id = Array("vertex-vm-disk".utf8)
                 var written: uint32 = 0
-                if let b = data.first, b.Writable {
-                    let n = min(int(b.Count), 20, id.count)
-                    try q.memory.Write(b.Address, Array(id[0..<n]))
-                    written = uint32(n)
+                if totalBuffers >= 3 {
+                    let b = chain.Buffers[1]
+                    if b.Writable && b.Count > 0 {
+                        let n = min(int(b.Count), 20, id.count)
+                        try q.memory.Write(b.Address, Array(id[0..<n]))
+                        written = uint32(n)
+                    }
                 }
                 return (Block.statusOk, written)
             case Block.typeDiscard:
-                for b in data where !b.Writable {
+                var idx = 1
+                while idx < totalBuffers - 1 {
+                    let b = chain.Buffers[idx]
+                    idx += 1
+                    if b.Writable || b.Count < 16 { continue }
                     let seg = try q.memory.Read(b.Address, count: 16)
                     try await image.Discard(binary.LittleEndian.Uint64(seg, from: 0) * 512,
                                             count: uint64(binary.LittleEndian.Uint32(seg, from: 8)) * 512)

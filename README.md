@@ -1,138 +1,203 @@
-# `vm`: Virtual Machines in Vertex
+# `vm`: Native Virtual Machines in Vertex
 
-Virtual machines running directly on the host OS's native hypervisor:
-- **macOS (Apple Silicon)**: `Hypervisor.framework` (arm64, in-kernel GICv3 via `hv_gic` on macOS 15+)
+`vm` provides native hardware virtualization for Vertex running directly on the host operating system's hypervisor:
+- **macOS (Apple Silicon)**: `Hypervisor.framework` (ARM64 with in-kernel GICv3 via `hv_gic` on macOS 15+)
 - **Windows**: Windows Hypervisor Platform (`WinHvPlatform`)
-- **Linux**: `/dev/kvm`
+- **Linux**: Kernel-based Virtual Machine (`/dev/kvm`)
 
-Zero instruction emulation. Zero QEMU or libvirt dependencies. 100% native execution where the guest architecture matches the host.
+Zero instruction emulation. Zero QEMU or libvirt dependencies. 100% native CPU and hardware-accelerated guest execution where the guest architecture matches the host.
 
 ---
 
-## 1. Architecture Overview
+## 1. Implemented Architecture
 
 ```
- user program     │ import "vm"
-                  │ let machine = try vm.Create(cfg); try machine.Start(); await machine.Wait()
-══════════════════╪═════════════════════════════════════════════════════════════════════════════
- vm               │ Config by ROLE (Storage, Network, Console, Display, Input)
-                  │ Machine lifecycle · platform profiles (.micro / .standard) · guest RAM
-                  │ dedicated vCPU OS threads · PSCI handler
-──────────────────┼─────────────────────────────────────────────────────────────────────────────
- devices, by spec │ vm/virtio   vm/nvme   vm/usb   vm/chipset   vm/display
- boot             │ vm/boot     Linux direct (arm64 Image, bzImage, PVH) · UEFI (pflash, fw_cfg)
- description      │ vm/acpi     vm/pci   (+ encoding/fdt)
- storage          │ vm/disk     vm/disk/qcow2   vm/disk/vhdx
-──────────────────┼─────────────────────────────────────────────────────────────────────────────
- contract         │ vm/device   GuestMemory · Mmio / Pio · Bus · Irq / Msi
-══════════════════╪═════════════════════════════════════════════════════════════════════════════
- vm/hypervisor    │ Partition · Vcpu · Exit · Capabilities (C++ interop)
-                  │ macOS: hv_darwin.cpp  ·  Windows: hv_windows.cpp  ·  Linux: hv_linux.cpp
-══════════════════╪═════════════════════════════════════════════════════════════════════════════
- host kernel      │ Apple Hypervisor (EL2) · Hyper-V · KVM
+ User Program / CLI      │ import "vm"  (or ./vm-run, ./disk-tool)
+                         │ let machine = try vm.Create(cfg); try machine.Start(); await machine.Wait()
+═════════════════════════╪═════════════════════════════════════════════════════════════════════════════════════
+ vm                      │ Machine lifecycle · Config by role · GuestRam mapping
+                         │ Dedicated vCPU OS threads (sync.Thread) · PSCI 1.0 handler
+                         │ Flattened Device Tree generator (encoding/fdt) with KASLR & RNG seeds
+─────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────
+ Devices (Active Micro)  │ • VirtIO MMIO (v2): Block, Net, Input (Tablet & Keyboard), Entropy (RNG)
+                         │ • Chipset: ARM PrimeCell PL011 UART (ttyAMA0), ARM PrimeCell PL031 RTC
+                         │ • Graphics: 32bpp linear software framebuffer (simple-framebuffer)
+─────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────
+ Boot Protocols          │ • Universal Linux ARM64 boot loader (vm/boot)
+                         │ • Automated kernel unpacking: Raw ARM64, EFI zboot (Zstandard & Gzip), RFC 1952 Gzip
+─────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────
+ Storage & Media         │ • Raw sparse disk images (.raw, .img)
+                         │ • Pure-Vertex ISO 9660 filesystem parser with El Torito boot discovery & file extraction
+                         │ • QCOW2 v2/v3 cluster reader (vm/disk/qcow2) · VHDX reader (vm/disk/vhdx)
+─────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────
+ User-Space Networking   │ • Pure user-space NAT (net/nat): DHCP lease daemon, ARP, ICMP echo
+                         │ • DNS proxy to upstream resolvers · Outbound TCP connection proxying (net/tcp)
+═════════════════════════╪═════════════════════════════════════════════════════════════════════════════════════
+ vm/device Contract      │ GuestMemory (pointer-backed RAM) · MmioBus · PioBus · Irq lines · Msi
+═════════════════════════╪═════════════════════════════════════════════════════════════════════════════════════
+ vm/hypervisor (Native)  │ Partition · Vcpu · Memory mapping (hv_vm_map) · Exits (MMIO, hypercall, sysreg)
+                         │ C++ bridge: hv_darwin.cpp (HVF) · hv_windows.cpp (WHP) · hv_linux.cpp (KVM)
 ```
 
 ---
 
-## 2. Package Index
+## 2. Package Summary
 
-| Package | Purpose |
-| :--- | :--- |
-| **`vm`** | Top-level Machine lifecycle (`Create`, `Start`, `Wait`, `Terminate`, `Close`), Config, guest RAM, wiring. |
-| **`vm/hypervisor`** | Partition, Vcpu, memory mapping, exits, and native platform hypervisor bridge. |
-| **`vm/device`** | `GuestMemory`, `Mmio`, `Pio`, `MmioBus`, `PioBus`, `Irq`, `Msi`. |
-| **`vm/boot`** | Boot protocols: Linux arm64 `Image`, `bzImage`, PVH ELF, UEFI pflash/vars, fw_cfg. |
-| **`vm/virtio`** | VirtIO 1.2 split & packed queues, MMIO and PCI transports, block, net, console, rng, vsock, balloon, input. |
-| **`vm/chipset`** | Arm PL011 UART (`ttyAMA0`), Arm PL031 RTC, 16550 UART, CMOS RTC, IOAPIC, ACPI GED. |
-| **`vm/pci`** | PCIe ECAM root complex, config space, BARs, MSI-X, `Function` protocol. |
-| **`vm/acpi`** | Hardware-reduced ACPI tables (FADT, MADT, GTDT, IORT, MCFG, SPCR) and AML builder. |
-| **`vm/nvme`** | NVMe 1.4 controller, admin & I/O queue pairs, PRP/SGL walking, namespace over `disk.Image`. |
-| **`vm/usb`** | xHCI controller, bulk-only mass storage (ISOs), HID keyboard and tablet. |
-| **`vm/display`** | Framebuffer interface and firmware `ramfb`. |
-| **`vm/disk`** | `Image` protocol, raw sparse files, and subpackages `qcow2` and `vhdx`. |
+| Package | Status | What It Does |
+| :--- | :--- | :--- |
+| **`vm`** | **Production** | Machine lifecycle (`Create`, `Start`, `Wait`, `Terminate`, `Close`), memory layout, vCPU thread coordination, platform wiring, and Device Tree generation. |
+| **`vm/hypervisor`** | **Production** | Thin, high-performance C++ hypervisor bridge (`hv_darwin.cpp`, `hv_windows.cpp`, `hv_linux.cpp`). Manages partitions, vCPU registers (`regs_arm64.vs`), dirty logging, and exit dispatch. |
+| **`vm/device`** | **Production** | Abstraction contracts used by all virtual devices: `GuestMemory`, `Mmio`, `Pio`, `MmioBus`, `PioBus`, `Irq`, `Msi`, and memory `Range`. |
+| **`vm/boot`** | **Production** | Kernel loaders and decompressors: `LinuxArm64` direct image boot, universal kernel sniffer & decompressor (`DetectKernelFormat`, `UnpackKernel`), PVH ELF (`boot/pvh.vs`), and bzImage (`boot/bzimage.vs`). |
+| **`vm/virtio`** | **Production** | VirtIO 1.2 specification implementation: modern MMIO transport (`virtio/mmio.vs`), split virtqueue ring engine (`virtio/queue.vs`), block device (`virtio.Block`), network device (`virtio.Net`), tablet & keyboard input (`virtio.Input`), and hardware entropy device (`virtio.Rng`). |
+| **`vm/chipset`** | **Production** | Platform peripherals: ARM PrimeCell PL011 UART (`ttyAMA0` with FIFO and interrupt signaling) and ARM PrimeCell PL031 Real-Time Clock. |
+| **`vm/display`** | **Production** | Double-buffered 32bpp XRGB8888 software framebuffer mapped at GPA `0x3000_0000`, simple-framebuffer Device Tree node, and snapshot RGBA exporter. |
+| **`vm/disk`** | **Production** | Disk backend protocol (`Image`), raw disk driver, pure-Vertex ISO 9660 filesystem parser (`disk/iso.vs` with PVD, El Torito, directory reader, boot file discovery, and chunked extraction), QCOW2 reader (`disk/qcow2`), and VHDX reader (`disk/vhdx`). |
 
 ---
 
-## 3. Quick Start
+## 3. Included CLI Programs
 
-### Prerequisites
-- macOS Apple Silicon (macOS 15+ recommended for in-kernel GICv3)
-- Vertex compiler `vsc`
-- `com.apple.security.hypervisor` entitlement (provided in `entitlements.plist`)
+The repository includes four executable tools in `cmd/`:
 
-### 1. Run Offline Checks
-The offline test suite validates device models, queue descriptors, boot headers, and Device Tree / ACPI emission without requiring hypervisor privileges:
+### 1. `vm-run` (`cmd/vm-run`)
+Interactive virtual machine runner supporting headless microVMs, graphical desktop live ISOs, and automated distribution installers.
+- **One-Click ISO Boot**: Automatically detects optical discs (`--iso <path>`), inspects ISO 9660 directory structures, locates the kernel and initramfs, extracts them in memory, adjusts memory and CPU sizing, and configures distribution-specific command lines.
+- **Kernel Auto-Decompression**: Transparently detects and unpacks raw ARM64 Images, Gzip streams, and EFI zboot PE executables (Zstandard / Gzip) on the fly.
+- **Interactive Graphical Window**: Powered by `ui/window` with dynamic aspect-fit scaling (`ScalingMode.aspectFit`), letterboxing, resizable window support, VirtIO absolute tablet pointer tracking, and full keyboard event forwarding.
+- **User-Space NAT Networking**: Out-of-the-box guest internet connectivity without root/sudo, host bridges, or TUN/TAP devices (DHCP server, ARP, ICMP echo, DNS proxy, TCP socket translation).
+- **Screenshot Capture**: Snapshot the guest framebuffer directly to a PNG file (`--screenshot <path>`).
+
+### 2. `disk-tool` (`cmd/disk`)
+Comprehensive disk and ISO management utility:
+- `info <path>`: Inspects partition and format metadata (QCOW2, VHDX, Raw, ISO 9660).
+- `list-iso <iso> [dir]`: Traverses and lists files and directories inside an ISO 9660 disc.
+- `extract <iso> <file> <dest>`: Extracts any file directly from an ISO image.
+- `boot-files <iso>`: Locates distribution boot files and recommended kernel parameters.
+- `extract-kernel <iso> [dest]`: Extracts AND decompresses the boot kernel to a raw ARM64 Image.
+- `create <path> <size>`: Creates sparse raw disk images (e.g., `10G`, `512M`).
+- `convert <source> <dest>`: Converts/copies disk images to raw disk images.
+
+### 3. `check` (`cmd/check`)
+Offline test suite with 86 passing verification checks covering all device models, VirtIO queues, FDT generation, network packet parsers, ISO 9660 directory structures, and kernel decompressors without requiring hypervisor permissions.
+
+### 4. `boot-test` (`cmd/boot-test`)
+Live hypervisor integration test suite executing bare-metal machine cycles and direct kernel boots against Apple's `Hypervisor.framework`.
+
+---
+
+## 4. Quick Start
+
+### Build and Codesign
+
+On macOS, binaries using `Hypervisor.framework` require the `com.apple.security.hypervisor` entitlement:
+
 ```bash
+# 1. Run offline verification suite (86 checks)
 vsc run ./cmd/check
-```
 
-### 2. Run Hypervisor Boot Tests
-Builds and executes both synthetic bare-metal guest tests and full Linux kernel boot tests:
-```bash
-vsc build -o ./boot-test ./cmd/boot-test
-codesign --entitlements ./entitlements.plist --force -s - ./boot-test
-./boot-test
-```
-
-### 3. Interactive Linux VM Runner (`vm-run`)
-Launch an interactive Alpine Linux microVM with terminal console and optional disk image:
-```bash
+# 2. Build and sign the VM runner
 vsc build -o ./vm-run ./cmd/vm-run
 codesign --entitlements ./entitlements.plist --force -s - ./vm-run
 
-# Boot Alpine Linux microVM
+# 3. Build the disk utility
+vsc build -o ./disk-tool ./cmd/disk
+```
+
+### Running Virtual Machines
+
+```bash
+# Direct boot an Alpine Linux microVM (headless terminal mode)
 ./vm-run --kernel testdata/Image --initrd testdata/initramfs-virt
 
-# Boot with an attached VirtIO disk
-./vm-run --kernel testdata/Image --initrd testdata/initramfs-virt --disk my_disk.raw
+# Direct one-click boot a Debian Installer ISO (text mode)
+./vm-run --iso testdata/debian/mini.iso
+
+# Direct one-click boot an Ubuntu Desktop Live ISO with graphical window
+./vm-run --iso ubuntu-26.04.1-desktop-arm64.iso --display
+
+# Boot with custom memory, vCPUs, and an attached secondary disk
+./vm-run --iso installer.iso --memory 2048 --cpus 2 --disk data.raw --display
+
+# Save a screenshot of the guest display to PNG after booting
+./vm-run --iso testdata/debian/mini.iso --display --screenshot installer.png --timeout 5
 ```
 
-### 4. Disk Utility (`cmd/disk`)
-Manage disk images (raw, qcow2, vhdx):
+### Inspecting and Extracting ISO Images
+
 ```bash
-# Show image details
-vsc run ./cmd/disk -- info my_disk.raw
+# Inspect ISO volume descriptor and El Torito bootability
+./disk-tool info testdata/debian/mini.iso
 
-# Create a new raw disk image
-vsc run ./cmd/disk -- create my_disk.raw 10G
+# List files in the root or a subfolder of an ISO
+./disk-tool list-iso testdata/debian/mini.iso
+./disk-tool list-iso ubuntu-26.04.1-desktop-arm64.iso casper
 
-# Convert/copy an image
-vsc run ./cmd/disk -- convert source.qcow2 target.raw
+# Automatically detect kernel, initramfs, and recommended cmdline
+./disk-tool boot-files testdata/debian/mini.iso
+
+# Extract and decompress an EFI zboot or Gzip kernel to a bootable ARM64 Image
+./disk-tool extract-kernel ubuntu-26.04.1-desktop-arm64.iso ./Image
 ```
 
 ---
 
-## 4. Example: Launching a Linux microVM in Vertex
+## 5. Using the `vm` Package in Vertex Code
 
-```swift
+```vertex
 import "fs"
 import "vm"
+import "vm/boot"
 import "vm/disk"
 
-// 1. Configure the virtual machine
-var cfg = vm.Config(cpus: 2, memory: 1024 << 20) // 2 vCPUs, 1 GiB RAM
-cfg.Boot = .linux(
-    kernel: try fs.Open("testdata/Image").ReadToEnd(),
-    initrd: try fs.Open("testdata/initramfs-virt").ReadToEnd(),
-    cmdline: "console=ttyAMA0 earlycon=pl011,0x09000000 reboot=k panic=-1"
-)
+func runMyVm() async throws {
+    // 1. Configure the virtual machine
+    var cfg = vm.Config(cpus: 2, memory: 1024 << 20) // 2 vCPUs, 1 GiB RAM
+    
+    // Load and unpack kernel (supports raw ARM64 Image, gzip, and EFI zboot)
+    let rawKernel = try fs.Open(fs.Path("Image")).ReadToEnd()
+    let kernel = try await boot.UnpackKernel(rawKernel)
+    let initrd = try? fs.Open(fs.Path("initrd")).ReadToEnd()
 
-// 2. Attach optional storage and network
-let diskImg = try await vm.OpenDisk(fs.Path("disks/rootfs.raw"))
-cfg.Storage.append(.disk(diskImg))
-cfg.Network.append(.nat())
+    cfg.Boot = .linux(
+        kernel: kernel,
+        initrd: initrd,
+        cmdline: "console=ttyAMA0 earlycon=pl011,0x09000000 reboot=k panic=-1"
+    )
 
-// 3. Create, start, and await exit
-let machine = try vm.Create(cfg, consoleWriter: vm.StdioWriter())
-defer { machine.Close() }
+    // 2. Attach storage, network, and display
+    let diskImg = try await vm.OpenDisk(fs.Path("rootfs.raw"))
+    cfg.Storage.append(.disk(diskImg))
+    cfg.Network.append(.nat())
+    cfg.Display = .custom(width: 1024, height: 768)
 
-try machine.Start()
-let status = try await machine.Wait()
-print("VM exited with status: \(status)")
+    // 3. Create, start, and await exit
+    let machine = try vm.Create(cfg, consoleWriter: vm.StdioWriter())
+    defer { machine.Close() }
+
+    try machine.Start()
+    let status = try await machine.Wait()
+    print("VM finished execution: \(status)")
+}
 ```
 
 ---
 
-## 5. License
+## 6. Project Roadmap & TODOs
 
-MIT
+The core microVM engine, direct Linux boot, ISO auto-boot, user-space networking, VirtIO input/display, and disk subsystems are fully functional. The following items represent planned architectural enhancements:
+
+- [ ] **Shared Host Folders (`virtio-fs` or 9P2000.L)**
+  - Implement a VirtIO shared filesystem gateway (`--share <host_dir>`) allowing guest Linux to mount host macOS folders without network overhead.
+- [ ] **PCIe ECAM Root Complex Integration (`vm/pci`)**
+  - Wire the PCIe ECAM host bridge and configuration space into `machine.vs` to support the `.standard` machine profile required for unmodified OS installers and Windows.
+- [ ] **UEFI Firmware Boot Path (`vm/boot/efi.vs`)**
+  - Integrate EDK2/OVMF standard firmware blobs (`pflash` flash banks and `fw_cfg` configuration paths) to boot non-direct kernels and arbitrary UEFI operating systems.
+- [ ] **NVMe Controller Model (`vm/nvme`)**
+  - Implement NVMe 1.4 controller specifications with Admin & I/O queue pairs and PRP list resolution over `disk.Image`.
+- [ ] **USB xHCI Controller (`vm/usb`)**
+  - Implement an xHCI controller with USB HID keyboard/tablet and mass-storage emulation for standard UEFI OS media.
+- [ ] **x86_64 Hypervisor Wiring**
+  - Complete KVM and WHP in-kernel LAPIC/IOAPIC setup and PVH 32-bit entry mode for AMD64 host environments.
+- [ ] **Dynamic Display Resize Notifications**
+  - Connect host window resize events to guest display resolution renegotiation via VirtIO GPU or EDID update notifications.

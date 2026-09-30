@@ -22,6 +22,13 @@ Loaders parse bytes and return a `Plan`: what goes where, and the entry
 state. `vm` carries it out. No loader touches a vCPU, so all of them run in
 `cmd/check`.
 
+### Kernel Format Detection & Automatic Unpacking
+Modern distribution kernels (e.g. Ubuntu, Debian, Fedora, Arch) are often distributed as compressed binaries or EFI PE executables:
+- **Raw ARM64 Image**: Magic `0x644d5241` ("ARMd") at offset 0x38. Loaded directly without modification.
+- **EFI zboot PE Images**: Portable Executable headers containing a `.linux` section with `zimg` header. Automatically parses PE sections, locates the payload offset, and decompresses Zstandard (`zstd`) or Gzip (`gzip`) streams into a raw ARM64 Image in memory.
+- **Gzip-compressed Images**: RFC 1952 streams (`0x1f 0x8b`), automatically decompressed via Vertex standard `compress/gzip`.
+- `boot.UnpackKernel(bytes)` handles format detection and unpacking automatically for `vm-run` and `cmd/disk`.
+
 Firmware is a guest artifact you supply, like a kernel: `edk2-aarch64-code.fd`
 or `OVMF_CODE.fd` from your distribution or Homebrew's `qemu` share. It is
 never vendored here.

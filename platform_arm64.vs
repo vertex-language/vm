@@ -1,6 +1,8 @@
 package vm
 
 import (
+    "crypto/rand"
+    "encoding/binary"
     "encoding/fdt"
     "vm/device"
 )
@@ -32,13 +34,42 @@ public struct PlatformArm64 {
     public static let PciMmio64Base: uint64    = 0x1_0000_0000
     public static let PciMmio64Size: uint64    = 0x1_0000_0000
 
+    public static let FbBase: uint64           = 0x3000_0000
+    public static let FbSize: uint64           = 0x0080_0000 // 8 MiB
+}
+
+public struct FramebufferConfig {
+    public let Base: uint64
+    public let Size: uint64
+    public let Width: int
+    public let Height: int
+    public let Stride: int
+    public let Format: string
+
+    public init(
+        base: uint64 = PlatformArm64.FbBase,
+        width: int = 800,
+        height: int = 600,
+        format: string = "a8r8g8b8"
+    ) {
+        self.Base = base
+        self.Width = width
+        self.Height = height
+        self.Stride = width * 4
+        self.Size = uint64(height * width * 4)
+        self.Format = format
+    }
+}
+
+extension PlatformArm64 {
     /// Builds a Flattened Device Tree (DTB) describing this arm64 microVM for Linux.
     public static func BuildFdt(
         vcpus: int,
         ram: device.Range,
         initrd: device.Range? = nil,
         cmdline: string,
-        virtioCount: int
+        virtioCount: int,
+        framebuffer: FramebufferConfig? = nil
     ) -> [uint8] {
         let tree = fdt.Tree()
 
@@ -57,6 +88,15 @@ public struct PlatformArm64 {
         if let rd = initrd {
             chosen.AddProperty("linux,initrd-start", rd.Base)
             chosen.AddProperty("linux,initrd-end", rd.End)
+        }
+
+        // Entropy seeds: randomizes kernel address space (KASLR) and seeds CRNG early
+        if let seedBytes = try? rand.Bytes(8) {
+            let seed = binary.LittleEndian.Uint64(seedBytes, from: 0)
+            chosen.AddProperty("kaslr-seed", seed)
+        }
+        if let rngSeed = try? rand.Bytes(32) {
+            chosen.AddProperty("rng-seed", rngSeed)
         }
 
         // CPUs node
@@ -139,6 +179,17 @@ public struct PlatformArm64 {
             vdev.AddProperty("reg", u64s: [addr, VirtioMmioSize])
             vdev.AddProperty("interrupt-parent", uint32(1))
             vdev.AddProperty("interrupts", u32s: [0, irqLine, 4])
+        }
+
+        // simple-framebuffer device
+        if let fb = framebuffer {
+            let fbNode = tree.Root.AddChild("framebuffer@\(string(fb.Base, radix: 16))")
+            fbNode.AddProperty("compatible", "simple-framebuffer")
+            fbNode.AddProperty("reg", u64s: [fb.Base, fb.Size])
+            fbNode.AddProperty("width", uint32(fb.Width))
+            fbNode.AddProperty("height", uint32(fb.Height))
+            fbNode.AddProperty("stride", uint32(fb.Stride))
+            fbNode.AddProperty("format", fb.Format)
         }
 
         return tree.Encode()

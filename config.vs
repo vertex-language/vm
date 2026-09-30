@@ -3,6 +3,7 @@ package vm
 import (
     "vm/disk"
     "net/ether"
+    "net/nat"
 )
 
 /// The platform profile determining bus topology and device standards.
@@ -34,9 +35,23 @@ public enum ConsoleRole {
     case none
 }
 
-public enum DisplayRole {
-    case framebuffer
-    case none
+public struct DisplayRole {
+    public let Enabled: bool
+    public let Width: int
+    public let Height: int
+
+    public init(enabled: bool, width: int = 800, height: int = 600) {
+        self.Enabled = enabled
+        self.Width = width
+        self.Height = height
+    }
+
+    public static let none = DisplayRole(enabled: false, width: 0, height: 0)
+    public static let framebuffer = DisplayRole(enabled: true, width: 800, height: 600)
+
+    public static func custom(width: int, height: int) -> DisplayRole {
+        DisplayRole(enabled: true, width: width, height: height)
+    }
 }
 
 public struct StorageRole {
@@ -66,8 +81,8 @@ public struct NetworkRole {
         self.IsNat = isNat
     }
 
-    public static func nat() -> NetworkRole {
-        NetworkRole(port: ether.LoopbackPort(), isNat: true)
+    public static func nat(config: nat.NatConfig = .default) -> NetworkRole {
+        NetworkRole(port: nat.NatPort(config: config), isNat: true)
     }
 
     public static func port(_ p: any ether.Port) -> NetworkRole {

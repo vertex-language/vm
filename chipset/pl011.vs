@@ -24,6 +24,7 @@ public final class Pl011: device.Mmio {
 
     static let rxInterrupt: uint32 = 1 << 4
     static let txInterrupt: uint32 = 1 << 5
+    static let rxTimeoutInterrupt: uint32 = 1 << 6
     static let id: [uint8] = [0x11, 0x10, 0x14, 0x00, 0x0d, 0xf0, 0x05, 0xb1]
 
     public init(output: any io.AsyncWriter, irq: any device.Irq) {
@@ -34,7 +35,7 @@ public final class Pl011: device.Mmio {
     public func Feed(_ bytes: [uint8]) {
         lock.withLock {
             rx.append(contentsOf: bytes)
-            ris |= Pl011.rxInterrupt
+            ris |= (Pl011.rxInterrupt | Pl011.rxTimeoutInterrupt)
         }
         update()
     }
@@ -44,7 +45,9 @@ public final class Pl011: device.Mmio {
             switch offset {
             case 0x000:
                 let b = rx.isEmpty ? 0 : uint32(rx.removeFirst())
-                if rx.isEmpty { ris &= ~Pl011.rxInterrupt }
+                if rx.isEmpty {
+                    ris &= ~(Pl011.rxInterrupt | Pl011.rxTimeoutInterrupt)
+                }
                 return b
             case 0x018: return (rx.isEmpty ? 0x10 : 0) | 0x80        // FR: RXFE, TXFE
             case 0x024: return ibrd

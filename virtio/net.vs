@@ -1,6 +1,9 @@
 package virtio
 
-import "net/ether"
+import (
+    "net/ether"
+    "sync"
+)
 
 /// virtio-net (spec §5.1): an Ethernet port for the guest. The other end
 /// is an `ether.Port`: `net/nat` (unprivileged NAT, the default) or
@@ -11,6 +14,7 @@ public final class Net: Device {
     let port: any ether.Port
     var queues: [Queue] = []
     var notify: (any Notifier)? = nil
+    let txLock = sync.Mutex()
 
     static let featureMac: uint64 = 1 << 5
     static let featureStatus: uint64 = 1 << 16
@@ -47,14 +51,26 @@ public final class Net: Device {
         Task {
             // Frames from the host, into buffers the guest posted on rx.
             while let frame = try? await self.port.Receive() {
-                guard let chain = try? rx.Pop() else {
-                    continue   // no buffers posted: drop, as a NIC would
+                var chain: Chain? = nil
+                for _ in 0..<100 {
+                    if let c = try? rx.Pop() {
+                        chain = c
+                        break
+                    }
+                    try? await Task.sleep(nanoseconds: 2_000_000)
                 }
+                guard let c = chain else {
+                    continue
+                }
+
                 var packet = [uint8](repeating: 0, count: Net.headerSize)
                 packet[10] = 1   // num_buffers
                 packet.append(contentsOf: frame)
-                if let n = try? rx.WriteAll(chain, packet), (try? rx.Push(chain.Head, written: n)) == true {
-                    self.notify?.QueueUsed(0)
+                if let n = try? rx.WriteAll(c, packet) {
+                    let needIntr = (try? rx.Push(c.Head, written: n)) ?? true
+                    if needIntr {
+                        self.notify?.QueueUsed(0)
+                    }
                 }
             }
         }
@@ -67,15 +83,35 @@ public final class Net: Device {
 
     public func Notified(queue index: int) {
         if index != 1 { return }
-        let tx = queues[1]
         Task {
-            while let chain = try? tx.Pop() {
-                if let bytes = try? tx.ReadAll(chain), bytes.count > Net.headerSize {
-                    try? await self.port.Send(Array(bytes[Net.headerSize...]))
+            await self.processTx()
+        }
+    }
+
+    func processTx() async {
+        guard queues.count > 1 else { return }
+        let tx = queues[1]
+        while true {
+            var item: Chain? = nil
+            do {
+                try txLock.withLock {
+                    item = try tx.Pop()
                 }
-                if (try? tx.Push(chain.Head, written: 0)) == true {
-                    self.notify?.QueueUsed(1)
-                }
+            } catch {
+                item = nil
+            }
+            guard let chain = item else { break }
+
+            if let bytes = try? tx.ReadAll(chain), bytes.count > Net.headerSize {
+                let frame = Array(bytes[Net.headerSize...])
+                try? await self.port.Send(frame)
+            }
+            var needIntr = true
+            txLock.withLock {
+                needIntr = (try? tx.Push(chain.Head, written: 0)) ?? true
+            }
+            if needIntr {
+                self.notify?.QueueUsed(1)
             }
         }
     }

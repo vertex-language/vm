@@ -129,9 +129,16 @@ public final class Queue {
 
     /// Copies the chain's readable bytes out of guest memory.
     public func ReadAll(_ chain: Chain) throws -> [uint8] {
-        var out: [uint8] = []
-        for b in chain.Buffers where !b.Writable {
-            out.append(contentsOf: try memory.Read(b.Address, count: int(b.Count)))
+        var out = [uint8]()
+        let total = chain.Buffers.count
+        var idx = 0
+        while idx < total {
+            let b = chain.Buffers[idx]
+            if !b.Writable && b.Count > 0 {
+                let chunk = try memory.Read(b.Address, count: int(b.Count))
+                out.append(contentsOf: chunk)
+            }
+            idx += 1
         }
         return out
     }
@@ -140,11 +147,18 @@ public final class Queue {
     /// how many fit.
     public func WriteAll(_ chain: Chain, _ bytes: borrowing [uint8]) throws -> uint32 {
         var done = 0
-        for b in chain.Buffers where b.Writable {
-            if done >= bytes.count { break }
-            let n = min(int(b.Count), bytes.count - done)
-            try memory.Write(b.Address, Array(bytes[done..<done + n]))
-            done += n
+        let total = chain.Buffers.count
+        var idx = 0
+        while idx < total {
+            let b = chain.Buffers[idx]
+            if b.Writable && b.Count > 0 && done < bytes.count {
+                let n = min(int(b.Count), bytes.count - done)
+                if n > 0 {
+                    try memory.Write(b.Address, Array(bytes[done..<done + n]))
+                    done += n
+                }
+            }
+            idx += 1
         }
         return uint32(done)
     }
