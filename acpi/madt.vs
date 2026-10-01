@@ -20,9 +20,14 @@ public enum Madt {
         public var Redistributor: uint64
         public var RedistributorSize: uint32
         public var Its: uint64 = 0
-        /// The PPI of the virtual timer's maintenance interrupt, and the
-        /// performance monitor's; 0 for none.
-        public var MaintenanceIrq: uint32 = 25
+        /// A GIC MSI frame (GICv2m-style) and the SPIs its writes raise.
+        public var MsiFrame: uint64 = 0
+        public var MsiSpiBase: uint32 = 0
+        public var MsiSpiCount: uint32 = 0
+        /// The GIC's virtualization maintenance interrupt and the
+        /// performance monitor's PPI; 0 for none. Guests get no EL2, so no
+        /// maintenance interrupt.
+        public var MaintenanceIrq: uint32 = 0
         public var PmuIrq: uint32 = 23
 
         public init(cpus: int, distributor: uint64, redistributor: uint64, redistributorSize: uint32) {
@@ -63,12 +68,13 @@ public enum Madt {
             t.U32(o.PmuIrq)
             t.U64(0)                            // parked address
             t.U64(0)                            // physical base (GICv3: none)
-            t.U64(0); t.U64(0); t.U64(0)        // GICV, GICH, (unused)
+            t.U64(0); t.U64(0)                  // GICV, GICH
             t.U32(o.MaintenanceIrq)
             t.U64(0)                            // GICR base: the GICR structure covers it
             t.U64(uint64(i))                    // MPIDR
             t.U8(0)                             // efficiency class
-            t.Zeroes(3)
+            t.U8(0)                             // reserved
+            t.U16(0)                            // SPE overflow interrupt: none
         }
         t.U8(0x0c); t.U8(24)                    // GICD
         t.U16(0)
@@ -81,6 +87,15 @@ public enum Madt {
         t.U16(0)
         t.U64(o.Redistributor)
         t.U32(o.RedistributorSize)
+        if o.MsiFrame != 0 {
+            t.U8(0x0d); t.U8(24)                // GIC MSI frame
+            t.U16(0)
+            t.U32(0)                            // frame ID
+            t.U64(o.MsiFrame)
+            t.U32(1)                            // flags: the SPI base and count below
+            t.U16(uint16(o.MsiSpiCount))
+            t.U16(uint16(o.MsiSpiBase))
+        }
         if o.Its != 0 {
             t.U8(0x0f); t.U8(20)                // ITS
             t.U16(0)

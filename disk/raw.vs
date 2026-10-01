@@ -18,17 +18,20 @@ public final class Raw: Image {
     public func ReadAt(_ offset: uint64, into buffer: inout [uint8]) async throws {
         try CheckRange(self, offset, uint64(buffer.count))
         // TODO: run on sync.ThreadPoolExecutor.Shared; fs.File is synchronous.
-        var done = 0
+        let n = try file.Read(into: &buffer, at: int64(offset))
+        if n >= buffer.count || n <= 0 {
+            return   // a short file reads as zeroes past its end
+        }
+        // A short read: finish the rest a piece at a time.
+        var done = n
         while done < buffer.count {
-            var chunk = [uint8](repeating: 0, count: buffer.count - done)
-            let n = try file.Read(into: &chunk, at: int64(offset) + int64(done))
-            if n <= 0 {
-                break   // a short file reads as zeroes past its end
-            }
-            for i in 0..<n {
+            var chunk = [uint8](repeating: 0, count: min(buffer.count - done, 1 << 20))
+            let got = try file.Read(into: &chunk, at: int64(offset) + int64(done))
+            if got <= 0 { break }
+            for i in 0..<got {
                 buffer[done + i] = chunk[i]
             }
-            done += n
+            done += got
         }
     }
 

@@ -22,6 +22,7 @@ int32_t hvGetReg(int64_t, int32_t, uint64_t*) noexcept { return Code::unsupporte
 int32_t hvSetReg(int64_t, int32_t, uint64_t) noexcept { return Code::unsupported; }
 int32_t hvSetSegment(int64_t, int32_t, uint64_t, uint32_t, uint16_t, uint16_t) noexcept { return Code::unsupported; }
 int32_t hvUnmaskTimer(int64_t) noexcept { return Code::unsupported; }
+int32_t hvGicReg(int64_t, int32_t, uint32_t, uint64_t*) noexcept { return Code::unsupported; }
 int32_t hvKick(int64_t) noexcept { return Code::unsupported; }
 void hvCloseVcpu(int64_t) noexcept {}
 int32_t lastError() noexcept { return 0; }

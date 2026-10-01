@@ -1,5 +1,7 @@
 package acpi
 
+import "encoding/binary"
+
 /// A tiny AML (ACPI Machine Language) writer: enough to describe devices
 /// in a DSDT: names, integers, strings, buffers, packages, devices,
 /// methods and resource templates. It builds bytecode directly; there's no
@@ -43,13 +45,13 @@ public struct Aml {
             a.Bytes = [bytePrefix, uint8(v)]
         } else if v <= 0xffff {
             a.Bytes = [wordPrefix]
-            LE.AppendUint16(&a.Bytes, uint16(v))
+            binary.LittleEndian.AppendUint16(&a.Bytes, uint16(v))
         } else if v <= 0xffff_ffff {
             a.Bytes = [dwordPrefix]
-            LE.AppendUint32(&a.Bytes, uint32(v))
+            binary.LittleEndian.AppendUint32(&a.Bytes, uint32(v))
         } else {
             a.Bytes = [qwordPrefix]
-            LE.AppendUint64(&a.Bytes, v)
+            binary.LittleEndian.AppendUint64(&a.Bytes, v)
         }
         return a
     }
@@ -102,6 +104,13 @@ public struct Aml {
     /// Method(NAME, 0) { Return(value) }
     public mutating func ReturnMethod(_ name: string, _ value: Aml) {
         let inner = nameSeg(name) + [0] + [Aml.returnOp] + value.Bytes
+        Bytes.append(Aml.methodOp)
+        Bytes.append(contentsOf: Aml.pkgLength(inner.count) + inner)
+    }
+
+    /// Method(NAME, 1) { Notify(target, value) }
+    public mutating func NotifyMethod(_ name: string, target: string, value: uint8) {
+        let inner = nameSeg(name) + [1] + [0x86] + nameSeg(target) + [Aml.bytePrefix, value]
         Bytes.append(Aml.methodOp)
         Bytes.append(contentsOf: Aml.pkgLength(inner.count) + inner)
     }
@@ -169,23 +178,64 @@ public struct Resources {
     /// A 32-bit fixed memory range.
     public mutating func Memory32(base: uint32, count: uint32) {
         Bytes.append(contentsOf: [0x86, 9, 0, 1])   // Memory32Fixed, read/write
-        LE.AppendUint32(&Bytes, base)
-        LE.AppendUint32(&Bytes, count)
+        binary.LittleEndian.AppendUint32(&Bytes, base)
+        binary.LittleEndian.AppendUint32(&Bytes, count)
     }
 
     /// An extended interrupt: a GIC SPI or IOAPIC GSI, level, active high.
     public mutating func Interrupt(_ gsi: uint32, edge: bool = false) {
         Bytes.append(contentsOf: [0x89, 6, 0, edge ? 0x03 : 0x01, 1])
-        LE.AppendUint32(&Bytes, gsi)
+        binary.LittleEndian.AppendUint32(&Bytes, gsi)
     }
 
     /// A fixed I/O port range.
     public mutating func Io(base: uint16, count: uint8) {
         Bytes.append(contentsOf: [0x47, 1])
-        LE.AppendUint16(&Bytes, base)
-        LE.AppendUint16(&Bytes, base)
+        binary.LittleEndian.AppendUint16(&Bytes, base)
+        binary.LittleEndian.AppendUint16(&Bytes, base)
         Bytes.append(1)
         Bytes.append(count)
+    }
+
+    /// WordBusNumber descriptor (0x88, 13 bytes payload)
+    public mutating func WordBusNumber(minBus: uint16, maxBus: uint16) {
+        Bytes.append(contentsOf: [0x88, 13, 0, 2, 0x0c, 0])
+        binary.LittleEndian.AppendUint16(&Bytes, 0) // granularity
+        binary.LittleEndian.AppendUint16(&Bytes, minBus)
+        binary.LittleEndian.AppendUint16(&Bytes, maxBus)
+        binary.LittleEndian.AppendUint16(&Bytes, 0) // translation
+        binary.LittleEndian.AppendUint16(&Bytes, maxBus - minBus + 1)
+    }
+
+    /// DWordMemory descriptor (0x87, 23 bytes payload)
+    public mutating func DWordMemory(base: uint32, size: uint32) {
+        Bytes.append(contentsOf: [0x87, 23, 0, 0, 0x0c, 1])   // memory, fixed, read-write
+        binary.LittleEndian.AppendUint32(&Bytes, 0) // granularity
+        binary.LittleEndian.AppendUint32(&Bytes, base)
+        binary.LittleEndian.AppendUint32(&Bytes, base + size - 1)
+        binary.LittleEndian.AppendUint32(&Bytes, 0) // translation
+        binary.LittleEndian.AppendUint32(&Bytes, size)
+    }
+
+    /// QWordMemory descriptor (0x8a, 43 bytes payload)
+    public mutating func QWordMemory(base: uint64, size: uint64) {
+        Bytes.append(contentsOf: [0x8a, 43, 0, 0, 0x0c, 1])   // memory, fixed, read-write
+        binary.LittleEndian.AppendUint64(&Bytes, 0) // granularity
+        binary.LittleEndian.AppendUint64(&Bytes, base)
+        binary.LittleEndian.AppendUint64(&Bytes, base + size - 1)
+        binary.LittleEndian.AppendUint64(&Bytes, 0) // translation
+        binary.LittleEndian.AppendUint64(&Bytes, size)
+    }
+
+    /// DWordIo descriptor (0x87, 23 bytes payload)
+    public mutating func DWordIo(min: uint32, max: uint32, translation: uint32, length: uint32) {
+        // I/O, fixed, entire range, type translation: memory on the host side.
+        Bytes.append(contentsOf: [0x87, 23, 0, 1, 0x0c, 0x13])
+        binary.LittleEndian.AppendUint32(&Bytes, 0) // granularity
+        binary.LittleEndian.AppendUint32(&Bytes, min)
+        binary.LittleEndian.AppendUint32(&Bytes, max)
+        binary.LittleEndian.AppendUint32(&Bytes, translation)
+        binary.LittleEndian.AppendUint32(&Bytes, length)
     }
 
     /// The template as a Buffer, with its end tag.

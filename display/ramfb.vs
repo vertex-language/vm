@@ -36,6 +36,7 @@ public final class Ramfb {
         let height = int(binary.BigEndian.Uint32(cfg, from: 20))
         let stride = int(binary.BigEndian.Uint32(cfg, from: 24))
         let format: Format = (fourcc == Ramfb.fourccXrgb8888) ? .xrgb8888 : .xbgr8888
+        print("[ramfb] GOP Framebuffer configured: \(width)x\(height) addr=0x\(string(addr, radix: 16)) stride=\(stride) format=\(format)")
         fb.Configure(address: device.GuestAddress(addr), width: width, height: height, stride: stride, format: format)
     }
 }

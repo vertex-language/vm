@@ -4,15 +4,19 @@ package main
 import (
     "encoding/fdt"
     "fs"
+    "fs/mmap"
     "io"
     "sync"
     "vm"
+    "vm/acpi"
     "vm/boot"
     "vm/chipset"
     "vm/device"
     "vm/disk"
     "vm/display"
+    "vm/pci"
     "vm/virtio"
+    "vm/windows"
     "net/ether"
     "net/nat"
 )
@@ -493,6 +497,136 @@ func main() async -> int32 {
             }
         }
     }
+
+    // 16. fw_cfg DMA transfer test
+    if let mapping = try? mmap.Anonymous(0x10000), let ptr = mapping.RawPointer {
+        let region = device.Region(guest: device.GuestAddress(0), count: 0x10000, host: ptr)
+        let mem = device.GuestMemory([region])
+        let fwcfg = boot.FwCfg(memory: mem)
+        let testPayload = Array("HELLO_FWCFG_DMA".utf8)
+        fwcfg.Add(boot.FwCfg.File(name: "opt/test", bytes: testPayload))
+
+        // Descriptor at 0x100: ctl = (0x0020 << 16) | 0x08 | 0x02 (Select file 0x20 and Read)
+        // length = 15, address = 0x500
+        let ctlVal: uint32 = (0x0020 << 16) | 0x08 | 0x02
+        let lenVal: uint32 = 15
+        let destAddr: uint64 = 0x500
+        var desc = [uint8](repeating: 0, count: 16)
+        desc[0] = uint8(ctlVal >> 24)
+        desc[1] = uint8((ctlVal >> 16) & 0xff)
+        desc[2] = uint8((ctlVal >> 8) & 0xff)
+        desc[3] = uint8(ctlVal & 0xff)
+        desc[4] = uint8(lenVal >> 24)
+        desc[5] = uint8((lenVal >> 16) & 0xff)
+        desc[6] = uint8((lenVal >> 8) & 0xff)
+        desc[7] = uint8(lenVal & 0xff)
+        for b in 0..<8 {
+            desc[8 + b] = uint8((destAddr >> (56 - 8 * b)) & 0xff)
+        }
+        try? mem.Write(device.GuestAddress(0x100), desc)
+
+        // Write descriptor address (in big endian) to fwcfg register 16
+        // Host address 0x100 swapped is 0x0001_0000_0000_0000 in little-endian register representation
+        var dmaRegVal: uint64 = 0
+        var tmpAddr: uint64 = 0x100
+        for _ in 0..<8 {
+            dmaRegVal = (dmaRegVal << 8) | (tmpAddr & 0xff)
+            tmpAddr >>= 8
+        }
+        fwcfg.Write(offset: 16, size: 8, value: dmaRegVal)
+
+        // Check descriptor ctl was cleared to 0 (completion)
+        if let updatedDesc = try? mem.Read(device.GuestAddress(0x100), count: 4) {
+            check(updatedDesc[0] == 0 && updatedDesc[1] == 0 && updatedDesc[2] == 0 && updatedDesc[3] == 0, "fw_cfg DMA completed and cleared control")
+        } else {
+            check(false, "Failed to read updated DMA descriptor")
+        }
+
+        // Check payload was written to 0x500
+        if let readPayload = try? mem.Read(device.GuestAddress(0x500), count: 15) {
+            check(string(decoding: readPayload, as: UTF8.self) == "HELLO_FWCFG_DMA", "fw_cfg DMA read transferred file contents to guest memory")
+        } else {
+            check(false, "Failed to read DMA destination buffer")
+        }
+    }
+
+    // 17. PCI Root Complex & BAR sizing test
+    final class MockPciFunction: pci.Function {
+        let Config: pci.ConfigSpace
+        let Bars: [pci.Bar]
+
+        init(bars: [pci.Bar]) {
+            self.Config = pci.ConfigSpace(vendor: 0x1234, device: 0x5678, classCode: pci.ClassCode.other, revision: 1)
+            self.Bars = bars
+        }
+
+        func ReadBar(_ bar: int, offset: uint64, size: uint8) -> uint64 { 0 }
+        func WriteBar(_ bar: int, offset: uint64, size: uint8, value: uint64) {}
+    }
+
+    let pciLayout = pci.Layout(
+        ecam: device.Range(base: 0x1000_0000, count: 0x1000_0000),
+        mmio32: device.Range(base: 0x2000_0000, count: 0x2000_0000),
+        mmio64: device.Range(base: 0x1_0000_0000, count: 0x1_0000_0000),
+        irqBase: 16
+    )
+    let pciRoot = pci.Root(pciLayout)
+    let mockDev = MockPciFunction(bars: [
+        pci.Bar(index: 0, size: 0x4000, kind: .memory64, prefetchable: false)
+    ])
+    if let slot = try? pciRoot.Attach(mockDev) {
+        check(slot == 1, "PCI device attached at slot 1")
+        let initialBar0 = mockDev.Config.Read(offset: 0x10, size: 4)
+        check((initialBar0 & 0x4) != 0, "PCI BAR 0 reports 64-bit memory kind")
+
+        // Perform BAR sizing probe: write 0xffff_ffff to BAR 0 register in ECAM (bus 0, dev 1, fn 0, reg 0x10)
+        let ecamOffset: uint64 = (1 << 15) | 0x10
+        pciRoot.Write(offset: ecamOffset, size: 4, value: 0xffff_ffff)
+
+        let probedBar0 = pciRoot.Read(offset: ecamOffset, size: 4)
+        check(probedBar0 == 0xffff_c004, "PCI BAR 0 sizing probe returns size mask 0xffff_c004")
+
+        // Program assigned address 0x2000_0000 into BAR 0
+        pciRoot.Write(offset: ecamOffset, size: 4, value: 0x2000_0000)
+        let readBackBar0 = pciRoot.Read(offset: ecamOffset, size: 4)
+        check((readBackBar0 & ~uint64(0xf)) == 0x2000_0000, "PCI BAR 0 readback returns programmed address")
+    } else {
+        check(false, "Failed to attach mock PCI device")
+    }
+
+    // 18. ACPI ARM64 Payload & TableLoader checks
+    let acpiCfg = acpi.Arm64Config(vcpus: 4, virtioCount: 2)
+    let acpiPayload = acpi.BuildArm64(acpiCfg)
+    check(acpiPayload.Tables.count > 0, "ACPI Tables blob generated")
+    check(acpiPayload.Rsdp.count == 36, "ACPI RSDP is 36 bytes")
+    check(acpiPayload.Loader.count > 0 && acpiPayload.Loader.count % 128 == 0, "ACPI TableLoader produces 128-byte aligned commands")
+    let rsdpSig = string(decoding: acpiPayload.Rsdp[0..<8], as: UTF8.self)
+    check(rsdpSig == "RSD PTR ", "ACPI RSDP magic signature matches 'RSD PTR '")
+    let dsdtSig = string(decoding: acpiPayload.Tables[0..<4], as: UTF8.self)
+    check(dsdtSig == "DSDT", "First ACPI table is DSDT")
+
+    // 19. Windows ISO Detection checks
+    let winIsoPath = "/Users/galaxy/Desktop/Windows11_Client_arm64_en-us_26300_9457.iso"
+    if let winIso = (try? windows.DetectIso(winIsoPath)) ?? nil {
+        check(winIso.IsArm64, "Windows ISO detected as ARM64")
+        check(winIso.VolumeId.contains("CCCOMA"), "Windows ISO VolumeId contains CCCOMA")
+        check(winIso.Edition.contains("Windows"), "Windows ISO Edition identifies as Windows")
+    } else {
+        check(false, "Failed to detect Windows ISO at \(winIsoPath)")
+    }
+
+    // 20. Windows 11 LabConfig / Unattended checks
+    let autoXml = windows.GenerateAutoUnattendXml()
+    check(autoXml.contains("BypassTPMCheck"), "AutoUnattend XML contains BypassTPMCheck")
+    check(autoXml.contains("BypassSecureBootCheck"), "AutoUnattend XML contains BypassSecureBootCheck")
+
+    // 21. The devices Windows guests get, and the ACPI they read.
+    checkPci()
+    await checkNvme()
+    await checkNvmeMsix()
+    await checkUsbStorage()
+    await checkXhci()
+    checkAcpiFixes()
 
     if failures == 0 {
         print("ALL VM CHECKS PASSED")

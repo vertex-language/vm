@@ -13,6 +13,11 @@ public struct PlatformArm64 {
     public static let GicDistSize: uint64      = 0x0001_0000
     public static let GicRedistBase: uint64    = 0x080a_0000
     public static let GicRedistSizePerCpu: uint64 = 0x0002_0000
+    /// A GICv2m-style MSI frame (Hypervisor.framework's MSI region): a
+    /// device's MSI write raises one of the SPIs it owns.
+    public static let GicMsiBase: uint64       = 0x0802_0000
+    public static let GicMsiSpiBase: uint32    = 128
+    public static let GicMsiSpiCount: uint32   = 64
 
     public static let UartBase: uint64         = 0x0900_0000
     public static let UartSize: uint64         = 0x0000_1000
@@ -30,12 +35,23 @@ public struct PlatformArm64 {
     public static let PciEcamBase: uint64      = 0x1000_0000
     public static let PciEcamSize: uint64      = 0x1000_0000
     public static let PciMmio32Base: uint64    = 0x2000_0000
-    public static let PciMmio32Size: uint64    = 0x2000_0000
-    public static let PciMmio64Base: uint64    = 0x1_0000_0000
-    public static let PciMmio64Size: uint64    = 0x1_0000_0000
+    public static let PciMmio32Size: uint64    = 0x1000_0000 // 256 MiB
+    public static let PciMmio64Base: uint64    = 0x04_0000_0000 // 16 GiB
+    public static let PciMmio64Size: uint64    = 0x04_0000_0000 // 16 GiB
+    /// PCI INTA–INTD swizzle across SPIs 3...6, as on QEMU's virt.
+    public static let PciIntxSpi: uint32       = 3
 
     public static let FbBase: uint64           = 0x3000_0000
     public static let FbSize: uint64           = 0x0080_0000 // 8 MiB
+
+    public static let FwCfgBase: uint64        = 0x0902_0000
+    public static let FwCfgSize: uint64        = 0x0000_1000
+
+    public static let Flash0Base: uint64       = 0x0000_0000
+    public static let Flash0Size: uint64       = 64 << 20 // 64 MiB
+
+    public static let Flash1Base: uint64       = 0x0400_0000
+    public static let Flash1Size: uint64       = 64 << 20 // 64 MiB
 }
 
 public struct FramebufferConfig {
@@ -69,7 +85,10 @@ extension PlatformArm64 {
         initrd: device.Range? = nil,
         cmdline: string,
         virtioCount: int,
-        framebuffer: FramebufferConfig? = nil
+        framebuffer: FramebufferConfig? = nil,
+        enableFwCfg: bool = false,
+        enableFlash: bool = false,
+        enablePci: bool = false
     ) -> [uint8] {
         let tree = fdt.Tree()
 
@@ -134,8 +153,6 @@ extension PlatformArm64 {
         let timer = tree.Root.AddChild("timer")
         timer.AddProperty("compatible", "arm,armv8-timer")
         timer.AddProperty("interrupt-parent", uint32(1))
-        // 4 timers: secure physical, non-secure physical, virtual, hypervisor physical
-        // Each has 3 cells: type (1 = PPI), interrupt number, flags (0xf08 = active-low level, all CPUs)
         timer.AddProperty("interrupts", u32s: [
             1, 13, 0xf08,
             1, 14, 0xf08,
@@ -156,7 +173,6 @@ extension PlatformArm64 {
         uart.AddProperty("compatible", strings: ["arm,pl011", "arm,primecell"])
         uart.AddProperty("reg", u64s: [UartBase, UartSize])
         uart.AddProperty("interrupt-parent", uint32(1))
-        // 0 = SPI, 1 = SPI line #1, 4 = level-sensitive high
         uart.AddProperty("interrupts", u32s: [0, UartIrq, 4])
         uart.AddProperty("clocks", u32s: [2, 2])
         uart.AddProperty("clock-names", strings: ["uartclk", "apb_pclk"])
@@ -169,6 +185,54 @@ extension PlatformArm64 {
         rtc.AddProperty("interrupts", u32s: [0, RtcIrq, 4])
         rtc.AddProperty("clocks", u32s: [2])
         rtc.AddProperty("clock-names", "apb_pclk")
+
+        // fw-cfg node
+        if enableFwCfg {
+            let fwcfg = tree.Root.AddChild("fw-cfg@\(string(FwCfgBase, radix: 16))")
+            fwcfg.AddProperty("compatible", "qemu,fw-cfg-mmio")
+            fwcfg.AddProperty("reg", u64s: [FwCfgBase, 0x18])
+            fwcfg.AddEmptyProperty("dma-coherent")
+        }
+
+        // CFI Flash node
+        if enableFlash {
+            let flash = tree.Root.AddChild("flash@0")
+            flash.AddProperty("compatible", "cfi-flash")
+            flash.AddProperty("reg", u64s: [Flash0Base, Flash0Size, Flash1Base, Flash1Size])
+            flash.AddProperty("bank-width", uint32(4))
+        }
+
+        // PCI Express Root Complex node
+        if enablePci {
+            let pcie = tree.Root.AddChild("pcie@\(string(PciEcamBase, radix: 16))")
+            pcie.AddProperty("compatible", "pci-host-ecam-generic")
+            pcie.AddProperty("device_type", "pci")
+            pcie.AddProperty("#address-cells", uint32(3))
+            pcie.AddProperty("#size-cells", uint32(2))
+            pcie.AddProperty("#interrupt-cells", uint32(1))
+            pcie.AddProperty("reg", u64s: [PciEcamBase, PciEcamSize])
+            pcie.AddProperty("bus-range", u32s: [0, 15])
+            pcie.AddEmptyProperty("dma-coherent")
+            pcie.AddProperty("ranges", u32s: [
+                0x0100_0000, 0, 0x0000_0000, 0, 0x3eff_0000, 0, 0x0001_0000,
+                0x0200_0000, 0, 0x2000_0000, 0, 0x2000_0000, 0, 0x1000_0000,
+                0x0300_0000, 4, 0, 4, 0, 4, 0
+            ])
+            pcie.AddProperty("interrupt-map-mask", u32s: [0x1800, 0, 0, 7])
+            var intMap: [uint32] = []
+            for dev in 0..<4 {
+                for pin in 1...4 {
+                    let devAddr = uint32(dev) << 11
+                    let spiLine = PciIntxSpi + uint32((dev + pin - 1) % 4)
+                    intMap.append(contentsOf: [
+                        devAddr, 0, 0, uint32(pin),
+                        1,
+                        0, spiLine, 4
+                    ])
+                }
+            }
+            pcie.AddProperty("interrupt-map", u32s: intMap)
+        }
 
         // VirtIO MMIO devices
         for i in 0..<virtioCount {

@@ -152,6 +152,14 @@ int64_t hvCreateVcpu(int64_t p, int32_t id) noexcept {
     if (r != HV_SUCCESS) return fail(r);
     // Affinity 0 carries the vCPU number, the way the FDT/MADT name CPUs.
     hv_vcpu_set_sys_reg(v.id, HV_SYS_REG_MPIDR_EL1, (uint64_t)id & 0xff);
+    // With the in-kernel GIC, HVF stops trapping PMU registers to us and
+    // injects UNDEF unless ID_AA64DFR0_EL1.PMUVer advertises a PMU; then it
+    // emulates PMUv3 itself. Windows' bootmgr reads PMCR_EL0 unconditionally.
+    uint64_t dfr0 = 0;
+    if (hv_vcpu_get_sys_reg(v.id, HV_SYS_REG_ID_AA64DFR0_EL1, &dfr0) == HV_SUCCESS &&
+        ((dfr0 >> 8) & 0xf) == 0) {
+        hv_vcpu_set_sys_reg(v.id, HV_SYS_REG_ID_AA64DFR0_EL1, (dfr0 & ~0xf00ull) | 0x100);
+    }
     v.used = true;
     return id;
 }
@@ -250,6 +258,11 @@ int32_t hvGetReg(int64_t handle, int32_t reg, uint64_t* out) noexcept {
     if (gpr(reg, &r)) return fail(hv_vcpu_get_reg(v->id, r, out));
     if (reg == RegArm64::sp) return fail(hv_vcpu_get_sys_reg(v->id, HV_SYS_REG_SP_EL1, out));
     if (reg == RegArm64::mpidr) return fail(hv_vcpu_get_sys_reg(v->id, HV_SYS_REG_MPIDR_EL1, out));
+    if (reg == RegArm64::elr_el1) return fail(hv_vcpu_get_sys_reg(v->id, HV_SYS_REG_ELR_EL1, out));
+    if (reg == RegArm64::esr_el1) return fail(hv_vcpu_get_sys_reg(v->id, HV_SYS_REG_ESR_EL1, out));
+    if (reg == RegArm64::far_el1) return fail(hv_vcpu_get_sys_reg(v->id, HV_SYS_REG_FAR_EL1, out));
+    if (reg == RegArm64::vbar_el1) return fail(hv_vcpu_get_sys_reg(v->id, HV_SYS_REG_VBAR_EL1, out));
+    if (reg & RegArm64::sysreg) return fail(hv_vcpu_get_sys_reg(v->id, (hv_sys_reg_t)(reg & 0xffff), out));
     return Code::invalid;
 }
 
@@ -260,6 +273,11 @@ int32_t hvSetReg(int64_t handle, int32_t reg, uint64_t value) noexcept {
     if (gpr(reg, &r)) return fail(hv_vcpu_set_reg(v->id, r, value));
     if (reg == RegArm64::sp) return fail(hv_vcpu_set_sys_reg(v->id, HV_SYS_REG_SP_EL1, value));
     if (reg == RegArm64::mpidr) return fail(hv_vcpu_set_sys_reg(v->id, HV_SYS_REG_MPIDR_EL1, value));
+    if (reg == RegArm64::elr_el1) return fail(hv_vcpu_set_sys_reg(v->id, HV_SYS_REG_ELR_EL1, value));
+    if (reg == RegArm64::esr_el1) return fail(hv_vcpu_set_sys_reg(v->id, HV_SYS_REG_ESR_EL1, value));
+    if (reg == RegArm64::far_el1) return fail(hv_vcpu_set_sys_reg(v->id, HV_SYS_REG_FAR_EL1, value));
+    if (reg == RegArm64::vbar_el1) return fail(hv_vcpu_set_sys_reg(v->id, HV_SYS_REG_VBAR_EL1, value));
+    if (reg & RegArm64::sysreg) return fail(hv_vcpu_set_sys_reg(v->id, (hv_sys_reg_t)(reg & 0xffff), value));
     return Code::invalid;
 }
 
@@ -271,6 +289,16 @@ int32_t hvUnmaskTimer(int64_t handle) noexcept {
     Vcpu* v = lookup(handle);
     if (!v) return Code::invalid;
     return fail(hv_vcpu_set_vtimer_mask(v->id, false));
+}
+
+int32_t hvGicReg(int64_t handle, int32_t kind, uint32_t reg, uint64_t* out) noexcept {
+    if (!out) return Code::invalid;
+    if (kind == 0) return fail(hv_gic_get_distributor_reg((hv_gic_distributor_reg_t)reg, out));
+    Vcpu* v = lookup(handle);
+    if (!v) return Code::invalid;
+    if (kind == 1) return fail(hv_gic_get_redistributor_reg(v->id, (hv_gic_redistributor_reg_t)reg, out));
+    if (kind == 2) return fail(hv_gic_get_icc_reg(v->id, (hv_gic_icc_reg_t)reg, out));
+    return Code::invalid;
 }
 
 int32_t hvKick(int64_t handle) noexcept {
@@ -305,6 +333,7 @@ int32_t hvGetReg(int64_t, int32_t, uint64_t*) noexcept { return Code::unsupporte
 int32_t hvSetReg(int64_t, int32_t, uint64_t) noexcept { return Code::unsupported; }
 int32_t hvSetSegment(int64_t, int32_t, uint64_t, uint32_t, uint16_t, uint16_t) noexcept { return Code::unsupported; }
 int32_t hvUnmaskTimer(int64_t) noexcept { return Code::unsupported; }
+int32_t hvGicReg(int64_t, int32_t, uint32_t, uint64_t*) noexcept { return Code::unsupported; }
 int32_t hvKick(int64_t) noexcept { return Code::unsupported; }
 void hvCloseVcpu(int64_t) noexcept {}
 int32_t lastError() noexcept { return 0; }

@@ -52,6 +52,10 @@ Zero instruction emulation. Zero QEMU or libvirt dependencies. 100% native CPU a
 | **`vm/virtio`** | **Production** | VirtIO 1.2 specification implementation: modern MMIO transport (`virtio/mmio.vs`), split virtqueue ring engine (`virtio/queue.vs`), block device (`virtio.Block`), network device (`virtio.Net`), tablet & keyboard input (`virtio.Input`), and hardware entropy device (`virtio.Rng`). |
 | **`vm/chipset`** | **Production** | Platform peripherals: ARM PrimeCell PL011 UART (`ttyAMA0` with FIFO and interrupt signaling) and ARM PrimeCell PL031 Real-Time Clock. |
 | **`vm/display`** | **Production** | Double-buffered 32bpp XRGB8888 software framebuffer mapped at GPA `0x3000_0000`, simple-framebuffer Device Tree node, and snapshot RGBA exporter. |
+| **`vm/pci`** | **Production** | PCIe root complex: ECAM configuration space with writable masks, BARs decoded where the guest programs them (`Root.MmioWindow`), MSI-X (delivered through the GIC's MSI frame), level-triggered INTx swizzled onto SPIs 3–6, and a PCIe capability. |
+| **`vm/nvme`** | **Production** | NVMe 1.4 controller on MSI-X or INTx: admin and I/O queue pairs, Identify, features, log pages, read/write/flush/write zeroes/deallocate, chained PRP lists. Windows' `stornvme` drives it inbox. |
+| **`vm/usb`** | **Production** | xHCI controller with a USB 2.0 root hub: command and event rings, slots and endpoint contexts, control/bulk/interrupt transfers. Devices: HID keyboard and tablet, and bulk-only mass storage as a CD-ROM (SCSI/MMC) or disk. |
+| **`vm/windows`** | **Production** | Windows ARM64 ISO detection, EDK2 firmware lookup, and the machine configuration Windows installs on. |
 | **`vm/disk`** | **Production** | Disk backend protocol (`Image`), raw disk driver, pure-Vertex ISO 9660 filesystem parser (`disk/iso.vs` with PVD, El Torito, directory reader, boot file discovery, and chunked extraction), QCOW2 reader (`disk/qcow2`), and VHDX reader (`disk/vhdx`). |
 
 ---
@@ -79,10 +83,10 @@ Comprehensive disk and ISO management utility:
 - `convert <source> <dest>`: Converts/copies disk images to raw disk images.
 
 ### 3. `check` (`cmd/check`)
-Offline test suite with 86 passing verification checks covering all device models, VirtIO queues, FDT generation, network packet parsers, ISO 9660 directory structures, and kernel decompressors without requiring hypervisor permissions.
+Offline test suite with 149 passing verification checks covering all device models (VirtIO, PCI, NVMe, xHCI, USB storage), FDT and ACPI generation, network packet parsers, ISO 9660 directory structures, and kernel decompressors without requiring hypervisor permissions.
 
 ### 4. `boot-test` (`cmd/boot-test`)
-Live hypervisor integration test suite executing bare-metal machine cycles and direct kernel boots against Apple's `Hypervisor.framework`.
+Live hypervisor integration test suite executing bare-metal machine cycles, direct kernel boots and a UEFI boot of a Windows ARM64 ISO against Apple's `Hypervisor.framework`. `./boot-test pmu` checks that PMU registers work under the in-kernel GIC; `./boot-test trace-late` traces xHCI and SCSI traffic once Windows has taken over.
 
 ---
 
@@ -93,7 +97,7 @@ Live hypervisor integration test suite executing bare-metal machine cycles and d
 On macOS, binaries using `Hypervisor.framework` require the `com.apple.security.hypervisor` entitlement:
 
 ```bash
-# 1. Run offline verification suite (86 checks)
+# 1. Run offline verification suite (149 checks)
 vsc run ./cmd/check
 
 # 2. Build and sign the VM runner
@@ -121,7 +125,29 @@ vsc build -o ./disk-tool ./cmd/disk
 
 # Save a screenshot of the guest display to PNG after booting
 ./vm-run --iso testdata/debian/mini.iso --display --screenshot installer.png --timeout 5
+
+# Install Windows 11 ARM64 from its ISO onto a 64 GiB NVMe disk (created if missing)
+./vm-run --iso Windows11_Client_arm64_en-us_26300_9457.iso --disk windows.raw
 ```
+
+### Windows ARM64
+
+A Windows ARM64 ISO is recognised by its volume ID and boots under UEFI
+(EDK2's `edk2-aarch64-code.fd`, from Homebrew's `qemu` or `--firmware`)
+on hardware Windows drives with inbox drivers:
+
+| Guest sees | Device | Windows driver |
+| :--- | :--- | :--- |
+| the ISO | USB CD-ROM on xHCI (bulk-only, SCSI/MMC) | `usbxhci`, `usbstor`, `cdrom` |
+| the disk | NVMe namespace | `stornvme` |
+| keyboard and mouse | USB HID keyboard and absolute tablet | `kbdhid`, `mouhid` |
+| the screen | ramfb, as UEFI GOP | Basic Display |
+| interrupts, CPUs, timers | GICv3 with an MSI frame (MSI-X for NVMe and xHCI), PSCI over HVC, generic timer, via ACPI | inbox HAL |
+
+The EFI variable store is saved beside the disk (`windows.raw.efivars`)
+when the VM exits, so the boot entries Setup writes survive. Cmd+Q
+closes the VM; Cmd on its own is the Windows key. There is no network
+yet: Windows has no inbox driver for virtio-net.
 
 ### Inspecting and Extracting ISO Images
 
@@ -189,14 +215,12 @@ The core microVM engine, direct Linux boot, ISO auto-boot, user-space networking
 
 - [ ] **Shared Host Folders (`virtio-fs` or 9P2000.L)**
   - Implement a VirtIO shared filesystem gateway (`--share <host_dir>`) allowing guest Linux to mount host macOS folders without network overhead.
-- [ ] **PCIe ECAM Root Complex Integration (`vm/pci`)**
-  - Wire the PCIe ECAM host bridge and configuration space into `machine.vs` to support the `.standard` machine profile required for unmodified OS installers and Windows.
-- [ ] **UEFI Firmware Boot Path (`vm/boot/efi.vs`)**
-  - Integrate EDK2/OVMF standard firmware blobs (`pflash` flash banks and `fw_cfg` configuration paths) to boot non-direct kernels and arbitrary UEFI operating systems.
-- [ ] **NVMe Controller Model (`vm/nvme`)**
-  - Implement NVMe 1.4 controller specifications with Admin & I/O queue pairs and PRP list resolution over `disk.Image`.
-- [ ] **USB xHCI Controller (`vm/usb`)**
-  - Implement an xHCI controller with USB HID keyboard/tablet and mass-storage emulation for standard UEFI OS media.
+- [x] **PCIe ECAM Root Complex Integration (`vm/pci`)**
+- [x] **UEFI Firmware Boot Path**: EDK2 in two flash banks, ACPI through fw_cfg's table loader, ramfb.
+- [x] **NVMe Controller Model (`vm/nvme`)**
+- [x] **USB xHCI Controller (`vm/usb`)**
+- [ ] **A NIC Windows drives inbox** (e1000e, or the like), for networking in Windows guests.
+- [x] **MSI-X for PCI devices**, through the in-kernel GIC's MSI frame (described in the MADT; there is no ITS).
 - [ ] **x86_64 Hypervisor Wiring**
   - Complete KVM and WHP in-kernel LAPIC/IOAPIC setup and PVH 32-bit entry mode for AMD64 host environments.
 - [ ] **Dynamic Display Resize Notifications**

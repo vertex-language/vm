@@ -26,6 +26,9 @@ public final class Block: Device {
     static let typeGetId: uint32 = 8
     static let typeDiscard: uint32 = 11
 
+    /// The most one copy moves between the image and guest memory.
+    static let chunk: uint32 = 4 << 20
+
     static let statusOk: uint8 = 0
     static let statusIoErr: uint8 = 1
     static let statusUnsupported: uint8 = 2
@@ -117,10 +120,17 @@ public final class Block: Device {
                     let b = chain.Buffers[idx]
                     idx += 1
                     if !b.Writable || b.Count == 0 { continue }
-                    var buf = [uint8](repeating: 0, count: int(b.Count))
-                    try await image.ReadAt(offset, into: &buf)
-                    try q.memory.Write(b.Address, buf)
-                    offset += uint64(b.Count)
+                    // Firmware asks for whole files in one descriptor; copy
+                    // through a bounded buffer rather than one that size.
+                    var done: uint32 = 0
+                    while done < b.Count {
+                        let n = min(b.Count - done, Block.chunk)
+                        var buf = [uint8](repeating: 0, count: int(n))
+                        try await image.ReadAt(offset, into: &buf)
+                        try q.memory.Write(b.Address.Adding(uint64(done)), buf)
+                        offset += uint64(n)
+                        done += n
+                    }
                     written += b.Count
                 }
                 return (Block.statusOk, written)
@@ -131,9 +141,14 @@ public final class Block: Device {
                     let b = chain.Buffers[idx]
                     idx += 1
                     if b.Writable || b.Count == 0 { continue }
-                    let buf = try q.memory.Read(b.Address, count: int(b.Count))
-                    try await image.WriteAt(offset, buf)
-                    offset += uint64(b.Count)
+                    var done: uint32 = 0
+                    while done < b.Count {
+                        let n = min(b.Count - done, Block.chunk)
+                        let buf = try q.memory.Read(b.Address.Adding(uint64(done)), count: int(n))
+                        try await image.WriteAt(offset, buf)
+                        offset += uint64(n)
+                        done += n
+                    }
                 }
                 return (Block.statusOk, 0)
             case Block.typeFlush:

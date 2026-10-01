@@ -391,6 +391,7 @@ int32_t hvSetSegment(int64_t handle, int32_t seg, uint64_t base, uint32_t limit,
 }
 
 int32_t hvUnmaskTimer(int64_t) noexcept { return Code::ok; }
+int32_t hvGicReg(int64_t, int32_t, uint32_t, uint64_t*) noexcept { return Code::unsupported; }
 
 int32_t hvKick(int64_t handle) noexcept {
     Vcpu* v = vcpu(handle);

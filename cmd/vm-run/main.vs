@@ -11,6 +11,7 @@ import (
     "vm/device"
     "vm/disk"
     "vm/hypervisor"
+    "vm/windows"
 )
 
 func printUsage() {
@@ -30,6 +31,9 @@ Options:
   --height <px>      Guest framebuffer height (default: 768)
   --screenshot <path> Save guest framebuffer snapshot to PNG file
   --timeout <sec>    Automatically terminate VM after N seconds
+  --firmware <path>  UEFI firmware code (default: Homebrew QEMU's edk2-aarch64-code.fd)
+  --vars <path>      UEFI variable store template (default: saved beside the disk)
+  --disk-size <GB>   Size of a disk --disk creates for Windows (default: 64)
   --net              Enable user-space NAT networking (default: enabled)
   --no-net           Disable networking
   --help, -h         Show this help message
@@ -146,6 +150,11 @@ public func main() async throws {
     var explicitKernel = false
     var explicitInitrd = false
     var explicitCmdline = false
+    var firmwarePath: string? = nil
+    var varsPath: string? = nil
+    var diskSizeGiB: uint64 = 64
+    var explicitMemory = false
+    var explicitCpus = false
 
     var i = 1
     while i < args.count {
@@ -234,6 +243,7 @@ public func main() async throws {
             if i + 1 < args.count {
                 if let m = int(args[i + 1]), m > 0 {
                     memoryMb = uint64(m)
+                    explicitMemory = true
                 }
                 i += 1
             }
@@ -241,12 +251,30 @@ public func main() async throws {
             if i + 1 < args.count {
                 if let c = int(args[i + 1]), c > 0 {
                     cpus = c
+                    explicitCpus = true
                 }
                 i += 1
             }
         case "--disk":
             if i + 1 < args.count {
                 diskPath = args[i + 1]
+                i += 1
+            }
+        case "--firmware":
+            if i + 1 < args.count {
+                firmwarePath = args[i + 1]
+                i += 1
+            }
+        case "--vars":
+            if i + 1 < args.count {
+                varsPath = args[i + 1]
+                i += 1
+            }
+        case "--disk-size":
+            if i + 1 < args.count {
+                if let g = int(args[i + 1]), g > 0 {
+                    diskSizeGiB = uint64(g)
+                }
                 i += 1
             }
         case "--cdrom", "--iso":
@@ -260,6 +288,24 @@ public func main() async throws {
             return
         }
         i += 1
+    }
+
+    // A Windows ARM64 ISO boots under UEFI with devices Windows has
+    // drivers for; see windows.vs.
+    if let cp = cdromPath, !explicitKernel, let info = (try? windows.DetectIso(cp)) ?? nil, info.IsArm64 {
+        print("[ISO] \(info.Edition) (\(info.VolumeId))")
+        var o = WindowsOptions(Iso: cp)
+        o.Disk = diskPath
+        o.DiskSize = diskSizeGiB << 30
+        o.Firmware = firmwarePath
+        o.Vars = varsPath
+        o.MemoryMiB = explicitMemory ? int(memoryMb) : 4096
+        o.Cpus = explicitCpus ? cpus : 4
+        o.Screenshot = screenshotPath
+        o.TimeoutSec = timeoutSec
+        o.Display = enableDisplay || screenshotPath == nil
+        try await runWindows(o)
+        return
     }
 
 func readFileBytes(_ path: fs.Path) throws -> [uint8] {

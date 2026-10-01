@@ -85,6 +85,13 @@ namespace RegArm64 {
     constexpr int32_t pc = 32;
     constexpr int32_t pstate = 33;
     constexpr int32_t mpidr = 34;       // MPIDR_EL1 (read; set where the platform allows)
+    constexpr int32_t elr_el1 = 35;
+    constexpr int32_t esr_el1 = 36;
+    constexpr int32_t far_el1 = 37;
+    constexpr int32_t vbar_el1 = 38;
+    // Any other system register: sysreg | op0<<14 | op1<<11 | CRn<<7 | CRm<<3 | op2,
+    // the MRS encoding (HVF's hv_sys_reg_t, KVM's ARM64_SYS_REG).
+    constexpr int32_t sysreg = 0x10000;
 }
 namespace RegAmd64 {
     constexpr int32_t rax = 0, rcx = 1, rdx = 2, rbx = 3, rsp = 4, rbp = 5, rsi = 6, rdi = 7;
@@ -149,6 +156,12 @@ export int32_t hvSetSegment(int64_t v, int32_t seg, uint64_t base, uint32_t limi
 // HVF: unmask the virtual timer after its interrupt has been delivered.
 // Elsewhere a no-op.
 export int32_t hvUnmaskTimer(int64_t v) noexcept;
+
+// Reads an in-kernel interrupt controller register, for diagnostics:
+// kind 0 the distributor (v ignored), 1 vCPU v's redistributor, 2 its CPU
+// interface (ICC). reg is the platform's own number for it. Call it on the
+// vCPU's thread.
+export int32_t hvGicReg(int64_t v, int32_t kind, uint32_t reg, uint64_t* out) noexcept;
 
 // From any thread: makes the vCPU's hvRun return ExitKind::canceled soon.
 export int32_t hvKick(int64_t v) noexcept;

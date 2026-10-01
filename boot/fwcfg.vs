@@ -82,17 +82,87 @@ public final class FwCfg: device.Mmio {
             if offset != 0 { return uint64(0) }
             let data = current()
             var v: uint64 = 0
-            // The data register is a byte stream; wide reads are big-endian.
-            for _ in 0..<int(size) {
-                v <<= 8
+            // The data register is a byte stream; CPU registers receive byte 0 in bits 0..7.
+            for i in 0..<int(size) {
                 if position < data.count {
-                    v |= uint64(data[position])
+                    v |= uint64(data[position]) << (8 * uint64(i))
                 }
                 position += 1
             }
             return v
         }
         return res
+    }
+
+    static let dmaCtlError: uint32 = 0x01
+    static let dmaCtlRead: uint32 = 0x02
+    static let dmaCtlSkip: uint32 = 0x04
+    static let dmaCtlSelect: uint32 = 0x08
+    static let dmaCtlWrite: uint32 = 0x10
+
+    var dmaHigh: uint32 = 0
+
+    func executeDma(_ dmaAddr: uint64) {
+        guard let desc = try? memory.Read(device.GuestAddress(dmaAddr), count: 16) else {
+            print("[fw_cfg] executeDma failed to read descriptor at 0x\(string(dmaAddr, radix: 16))")
+            return
+        }
+        // Big-endian descriptor: control (u32), length (u32), address (u64)
+        let ctl = (uint32(desc[0]) << 24) | (uint32(desc[1]) << 16) | (uint32(desc[2]) << 8) | uint32(desc[3])
+        let len = (uint32(desc[4]) << 24) | (uint32(desc[5]) << 16) | (uint32(desc[6]) << 8) | uint32(desc[7])
+        var bufAddr: uint64 = 0
+        for b in 0..<8 {
+            bufAddr = (bufAddr << 8) | uint64(desc[8 + b])
+        }
+
+        var hasError = false
+
+        if (ctl & FwCfg.dmaCtlSelect) != 0 {
+            selector = uint16(ctl >> 16)
+            position = 0
+        }
+
+        if (ctl & FwCfg.dmaCtlRead) != 0 {
+            let data = current()
+            let available = max(0, data.count - position)
+            let toRead = min(int(len), available)
+            if toRead > 0 {
+                let slice = Array(data[position..<(position + toRead)])
+                do {
+                    try memory.Write(device.GuestAddress(bufAddr), slice)
+                } catch {
+                    hasError = true
+                }
+                position += toRead
+            }
+            if int(len) > toRead {
+                let padding = [uint8](repeating: 0, count: int(len) - toRead)
+                do {
+                    try memory.Write(device.GuestAddress(bufAddr + uint64(toRead)), padding)
+                } catch {
+                    hasError = true
+                }
+                position += (int(len) - toRead)
+            }
+        } else if (ctl & FwCfg.dmaCtlWrite) != 0 {
+            if let writeBytes = try? memory.Read(device.GuestAddress(bufAddr), count: int(len)) {
+                let i = int(selector) - int(FwCfg.firstFile)
+                if i >= 0 && i < files.count {
+                    files[i].OnWrite?(writeBytes)
+                }
+            } else {
+                hasError = true
+            }
+        } else if (ctl & FwCfg.dmaCtlSkip) != 0 {
+            position += int(len)
+        }
+
+        // Clear control flags in descriptor to signal DMA completion
+        var resultCtl: [uint8] = [0, 0, 0, 0]
+        if hasError {
+            resultCtl[3] = uint8(FwCfg.dmaCtlError)
+        }
+        try? memory.Write(device.GuestAddress(dmaAddr), resultCtl)
     }
 
     public func Write(offset: uint64, size: uint8, value: uint64) {
@@ -103,11 +173,25 @@ public final class FwCfg: device.Mmio {
                 let v = uint16(truncatingIfNeeded: value)
                 selector = (v >> 8) | (v << 8)
                 position = 0
-            case 16, 20:
-                // TODO(P4): DMA: FWCfgDmaAccess { be32 control; be32 length;
-                // be64 address } at the written guest address; control bits
-                // read (2), skip (4), select (8), write (16).
-                break
+            case 16:
+                if size == 8 {
+                    // 64-bit store of big-endian address: swap to get host physical address
+                    var dmaAddr: uint64 = 0
+                    var v = value
+                    for _ in 0..<8 {
+                        dmaAddr = (dmaAddr << 8) | (v & 0xff)
+                        v >>= 8
+                    }
+                    executeDma(dmaAddr)
+                } else if size == 4 {
+                    dmaHigh = uint32(truncatingIfNeeded: value)
+                }
+            case 20:
+                if size == 4 {
+                    let dmaLow = uint32(truncatingIfNeeded: value)
+                    let dmaAddr = (uint64(dmaHigh) << 32) | uint64(dmaLow)
+                    executeDma(dmaAddr)
+                }
             default:
                 break
             }

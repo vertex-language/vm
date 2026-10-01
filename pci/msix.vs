@@ -30,6 +30,25 @@ public final class MsixTable {
 
     public var Vectors: int { entries.count }
 
+    /// The capability's message control changed: enable and function mask.
+    /// Vectors that came due while masked go out once nothing masks them.
+    func setControl(enabled: bool, masked: bool) {
+        var fire: [(uint64, uint32)] = []
+        lock.withLock {
+            Enabled = enabled
+            FunctionMasked = masked
+            if enabled && !masked {
+                for i in 0..<entries.count where entries[i].pending && !entries[i].masked {
+                    entries[i].pending = false
+                    fire.append((entries[i].address, entries[i].data))
+                }
+            }
+        }
+        for (a, d) in fire {
+            msi.Send(address: a, data: d)
+        }
+    }
+
     /// The MSI-X capability body for ConfigSpace.AddCapability(id: 0x11):
     /// table in `bar` at `tableOffset`, PBA at `pbaOffset`.
     public func Capability(bar: uint8, tableOffset: uint32, pbaOffset: uint32) -> [uint8] {

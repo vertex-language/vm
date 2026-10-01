@@ -191,6 +191,15 @@ public final class Vcpu {
         try check(hvUnmaskTimer(handle), "unmasking the timer")
     }
 
+    /// An in-kernel interrupt controller register, for diagnostics: kind 0
+    /// the distributor, 1 this vCPU's redistributor, 2 its CPU interface.
+    /// `reg` is the platform's number for it. Call on the vCPU's thread.
+    public func GicReg(kind: int32, _ reg: uint32) throws -> uint64 {
+        var value: uint64 = 0
+        try check(hvGicReg(handle, kind, reg, &value), "reading interrupt controller register 0x\(string(reg, radix: 16))")
+        return value
+    }
+
     /// Makes `Run` return `.canceled` soon. Safe from any thread.
     public func Kick() {
         _ = hvKick(handle)

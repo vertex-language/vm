@@ -6,6 +6,7 @@ import (
     "io"
     "sync"
     "time"
+    "vm/acpi"
     "vm/boot"
     "vm/chipset"
     "vm/device"
@@ -14,6 +15,7 @@ import (
     "vm/disk/vhdx"
     "vm/display"
     "vm/hypervisor"
+    "vm/usb"
     "vm/virtio"
 )
 
@@ -42,11 +44,17 @@ public final class Machine: PsciController {
     public var ConsoleUart: chipset.Pl011? { Wired.ConsoleUart }
     public var KeyboardInput: virtio.Input? { Wired.KeyboardInput }
     public var TabletInput: virtio.Input? { Wired.TabletInput }
+    /// A Windows guest's USB keyboard and tablet.
+    public var UsbKeyboard: usb.Keyboard? { Wired.UsbKeyboard }
+    public var UsbTablet: usb.Tablet? { Wired.UsbTablet }
     public var Framebuffer: display.Framebuffer? = nil
     var fbMapping: mmap.Mapping? = nil
+    var flash0: GuestRam? = nil
+    public var Pflash: chipset.PflashCfi01? = nil
 
     var psci: PsciHandler? = nil
     var vcpus: [VcpuWorker] = []
+    public var Vcpus: [VcpuWorker] { vcpus }
     var running = false
     var exitStatus: ExitStatus = .poweredOff
     var exitRequested = false
@@ -90,7 +98,10 @@ public final class Machine: PsciController {
         // 3. Create the in-kernel GICv3 interrupt controller on arm64
         try partition.CreateIrqChip(
             distributor: PlatformArm64.GicDistBase,
-            redistributor: PlatformArm64.GicRedistBase
+            redistributor: PlatformArm64.GicRedistBase,
+            msiBase: PlatformArm64.GicMsiBase,
+            msiFirst: PlatformArm64.GicMsiSpiBase,
+            msiCount: PlatformArm64.GicMsiSpiCount
         )
 
         // 4. Wire platform devices (UART, RTC, VirtIO)
@@ -181,10 +192,60 @@ public final class Machine: PsciController {
                     throw VmError.bootFailed("unsupported entry mode for arm64")
                 }
 
-            case .efi(let firmware, _):
-                // For UEFI, load firmware at reset or flash base
-                bootPc = PlatformArm64.RamBase
-                try ram.Memory.Write(device.GuestAddress(bootPc), firmware)
+            case .efi(let firmware, let vars):
+                // 1. Allocate and map Flash 0 (Code) at 0x0000_0000 (64 MiB)
+                let flash0 = try GuestRam(base: PlatformArm64.Flash0Base, size: PlatformArm64.Flash0Size)
+                try flash0.Map(into: partition)
+                try flash0.Memory.Write(device.GuestAddress(PlatformArm64.Flash0Base), firmware)
+                machine.flash0 = flash0
+
+                // 2. Attach Flash 1 (Vars) as PflashCfi01 MMIO device at 0x0400_0000 (64 MiB)
+                let pflash = chipset.PflashCfi01(size: int(PlatformArm64.Flash1Size), initialData: vars)
+                try wired.MmioBus.Insert(pflash, at: device.Range(base: PlatformArm64.Flash1Base, count: PlatformArm64.Flash1Size))
+                machine.Pflash = pflash
+
+                // 3. Framebuffer hook: if Ramfb was wired, assign to machine.Framebuffer
+                if let rfb = wired.Ramfb {
+                    machine.Framebuffer = rfb.Framebuffer
+                }
+
+                // 4. Inject ACPI tables via fw_cfg for UEFI guests (Windows & Linux)
+                if let fwcfg = wired.FwCfg {
+                    var acpiCfg = acpi.Arm64Config(
+                        vcpus: cfg.Cpus,
+                        virtioCount: wired.VirtioCount,
+                        pciMmio64Base: PlatformArm64.PciMmio64Base,
+                        pciMmio64Size: PlatformArm64.PciMmio64Size
+                    )
+                    acpiCfg.MsiFrameBase = PlatformArm64.GicMsiBase
+                    acpiCfg.MsiSpiBase = PlatformArm64.GicMsiSpiBase
+                    acpiCfg.MsiSpiCount = PlatformArm64.GicMsiSpiCount
+                    let payload = acpi.BuildArm64(acpiCfg)
+                    fwcfg.Add(boot.FwCfg.File(name: "etc/acpi/tables", bytes: payload.Tables))
+                    fwcfg.Add(boot.FwCfg.File(name: "etc/acpi/rsdp", bytes: payload.Rsdp))
+                    fwcfg.Add(boot.FwCfg.File(name: "etc/table-loader", bytes: payload.Loader))
+                }
+
+                // 5. Generate Device Tree (DTB) for UEFI
+                let dtb = PlatformArm64.BuildFdt(
+                    vcpus: cfg.Cpus,
+                    ram: ram.Range,
+                    initrd: nil,
+                    cmdline: "",
+                    virtioCount: wired.VirtioCount,
+                    framebuffer: fbConfig,
+                    enableFwCfg: wired.FwCfg != nil,
+                    enableFlash: true,
+                    enablePci: wired.PciRoot != nil
+                )
+
+                // 5. Place DTB at start of RAM (0x4000_0000)
+                let dtbAddr = PlatformArm64.RamBase
+                try ram.Memory.Write(device.GuestAddress(dtbAddr), dtb)
+
+                // 6. vCPU 0 resets at Flash 0 base (0x0000_0000) with X0 pointing to DTB
+                bootPc = PlatformArm64.Flash0Base
+                bootX0 = dtbAddr
             }
         }
 
@@ -256,6 +317,9 @@ public final class Machine: PsciController {
             v.Join()
         }
         Partition.Close()
+        flash0 = nil
+        Pflash = nil
+        fbMapping = nil
     }
 
     deinit {

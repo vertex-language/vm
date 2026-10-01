@@ -16,3 +16,6 @@
 # Local downloaded test media
 testdata/debian/
 testdata/ubuntu/
+
+# boot-test screenshots
+uefi_*.png

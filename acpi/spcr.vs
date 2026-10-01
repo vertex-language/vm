@@ -11,7 +11,10 @@ public func Spcr(kind: UartKind, address: uint64, irq: uint32, io: bool) -> [uin
     var t = Table(signature: "SPCR", revision: 2)
     t.U8(kind.rawValue)
     t.Zeroes(3)
-    t.Gas(space: io ? AddressSpace.io : AddressSpace.memory, bitWidth: 8, accessSize: 1, address: address)
+    // A PL011's registers are 32 bits wide; byte access to them is undefined.
+    let wide = kind == .pl011
+    t.Gas(space: io ? AddressSpace.io : AddressSpace.memory, bitWidth: wide ? 32 : 8,
+          accessSize: wide ? 3 : 1, address: address)
     t.U8(io ? 0x1 : 0x8)                       // interrupt type: 8259-style or GIC
     t.U8(io ? uint8(irq) : 0)                  // IRQ
     t.U32(irq)                                 // global system interrupt

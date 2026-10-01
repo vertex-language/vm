@@ -4,9 +4,14 @@ import (
     "io"
     "os/process"
     "sync"
+    "vm/boot"
     "vm/chipset"
     "vm/device"
+    "vm/display"
     "vm/hypervisor"
+    "vm/nvme"
+    "vm/pci"
+    "vm/usb"
     "vm/virtio"
     "net/ether"
 )
@@ -28,6 +33,20 @@ public final class GicIrq: device.Irq {
     public func Pulse() {
         Set(true)
         Set(false)
+    }
+}
+
+/// GicMsi delivers a PCI function's MSI write to the in-kernel GIC's MSI
+/// frame, which raises the SPI the data names.
+public final class GicMsi: device.Msi {
+    let partition: hypervisor.Partition
+
+    public init(partition: hypervisor.Partition) {
+        self.partition = partition
+    }
+
+    public func Send(address: uint64, data: uint32) {
+        try? partition.SendMsi(address: address, data: data)
     }
 }
 
@@ -77,6 +96,24 @@ public struct WiredDevices {
     public var TabletInput: virtio.Input? = nil
     public var Rng: virtio.Rng? = nil
     public var VirtioCount: int = 0
+    public var FwCfg: boot.FwCfg? = nil
+    public var PciRoot: pci.Root? = nil
+    public var Ramfb: display.Ramfb? = nil
+    /// Windows guests: the inbox-driver devices on PCI.
+    public var Xhci: usb.Xhci? = nil
+    public var UsbKeyboard: usb.Keyboard? = nil
+    public var UsbTablet: usb.Tablet? = nil
+    public var Nvme: nvme.Controller? = nil
+}
+
+func isEfiBoot(_ b: Boot?) -> bool {
+    if let boot = b {
+        switch boot {
+        case .efi: return true
+        default: return false
+        }
+    }
+    return false
 }
 
 /// WirePlatform instantiates and places devices on the buses according to the config.
@@ -98,6 +135,66 @@ public func WirePlatform(
     let rtcIrq = GicIrq(partition: partition, line: PlatformArm64.RtcIrq)
     let rtc = chipset.Pl031(irq: rtcIrq)
     try wired.MmioBus.Insert(rtc, at: device.Range(base: PlatformArm64.RtcBase, count: PlatformArm64.RtcSize))
+
+    // 3. fw_cfg device (for UEFI / Standard / Windows)
+    if cfg.Profile == .standard || cfg.Guest == .windows || isEfiBoot(cfg.Boot) {
+        let fwcfg = boot.FwCfg(memory: ram.Memory)
+        try wired.MmioBus.Insert(fwcfg, at: device.Range(base: PlatformArm64.FwCfgBase, count: PlatformArm64.FwCfgSize))
+        wired.FwCfg = fwcfg
+
+        if cfg.Display.Enabled || cfg.Guest == .windows || isEfiBoot(cfg.Boot) {
+            let rfb = display.Ramfb(memory: ram.Memory, fwcfg: fwcfg)
+            wired.Ramfb = rfb
+        }
+    }
+
+    // 4. PCIe Root Complex (for Standard / Windows)
+    if cfg.Profile == .standard || cfg.Guest == .windows || isEfiBoot(cfg.Boot) {
+        let pciLayout = pci.Layout(
+            ecam: device.Range(base: PlatformArm64.PciEcamBase, count: PlatformArm64.PciEcamSize),
+            mmio32: device.Range(base: PlatformArm64.PciMmio32Base, count: PlatformArm64.PciMmio32Size),
+            mmio64: device.Range(base: PlatformArm64.PciMmio64Base, count: PlatformArm64.PciMmio64Size),
+            irqBase: PlatformArm64.PciIntxSpi
+        )
+        let pciRoot = pci.Root(pciLayout, intx: { line in GicIrq(partition: partition, line: line) })
+        try wired.MmioBus.Insert(pciRoot, at: pciLayout.Ecam)
+        // BARs are wherever the firmware or OS programs them; the
+        // apertures decode them.
+        try wired.MmioBus.Insert(pciRoot.MmioWindow(pciLayout.Mmio32), at: pciLayout.Mmio32)
+        try wired.MmioBus.Insert(pciRoot.MmioWindow(pciLayout.Mmio64), at: pciLayout.Mmio64)
+        wired.PciRoot = pciRoot
+    }
+
+    // Windows drives none of the VirtIO devices with an inbox driver, so
+    // it gets what it does drive: xHCI with a keyboard, a tablet and the
+    // installer as a USB CD-ROM, and NVMe for disks.
+    if cfg.Guest == .windows, let root = wired.PciRoot {
+        let msi = GicMsi(partition: partition)
+        let xhci = usb.Xhci(memory: ram.Memory, msi: msi)
+        let kbd = usb.Keyboard()
+        let tablet = usb.Tablet()
+        xhci.Plug(kbd)
+        xhci.Plug(tablet)
+        var disks: [StorageRole] = []
+        for storage in cfg.Storage {
+            if storage.IsInstaller {
+                xhci.Plug(usb.Storage(storage.Image, kind: .cdrom))
+            } else {
+                disks.append(storage)
+            }
+        }
+        _ = try root.Attach(xhci)
+        wired.Xhci = xhci
+        wired.UsbKeyboard = kbd
+        wired.UsbTablet = tablet
+        if !disks.isEmpty {
+            let ctrl = nvme.Controller(memory: ram.Memory, msi: msi)
+            for d in disks { ctrl.Attach(d.Image) }
+            _ = try root.Attach(ctrl)
+            wired.Nvme = ctrl
+        }
+        return wired
+    }
 
     // 3. Storage devices
     var slot = 0
