@@ -11,6 +11,7 @@ import (
     "vm/hypervisor"
     "vm/nvme"
     "vm/pci"
+    "vm/tpm"
     "vm/usb"
     "vm/virtio"
     "net/ether"
@@ -99,11 +100,16 @@ public struct WiredDevices {
     public var FwCfg: boot.FwCfg? = nil
     public var PciRoot: pci.Root? = nil
     public var Ramfb: display.Ramfb? = nil
+    /// Android guests: the emulator's screen and its touchscreen and keys.
+    public var GoldfishFb: display.GoldfishFb? = nil
+    public var GoldfishEvents: chipset.GoldfishEvents? = nil
+    public var GoldfishBattery: chipset.GoldfishBattery? = nil
     /// Windows guests: the inbox-driver devices on PCI.
     public var Xhci: usb.Xhci? = nil
     public var UsbKeyboard: usb.Keyboard? = nil
     public var UsbTablet: usb.Tablet? = nil
     public var Nvme: nvme.Controller? = nil
+    public var Tpm: tpm.Tis? = nil
 }
 
 func isEfiBoot(_ b: Boot?) -> bool {
@@ -145,6 +151,16 @@ public func WirePlatform(
         if cfg.Display.Enabled || cfg.Guest == .windows || isEfiBoot(cfg.Boot) {
             let rfb = display.Ramfb(memory: ram.Memory, fwcfg: fwcfg)
             wired.Ramfb = rfb
+        }
+    }
+
+    // A TPM 2.0, for UEFI guests.
+    if let role = cfg.Tpm, isEfiBoot(cfg.Boot) {
+        switch role {
+        case .swtpm(let stateDir):
+            let tis = tpm.Tis(backend: tpm.Swtpm(stateDir: stateDir))
+            try wired.MmioBus.Insert(tis, at: device.Range(base: PlatformArm64.TpmBase, count: tpm.Tis.Size))
+            wired.Tpm = tis
         }
     }
 
@@ -202,7 +218,7 @@ public func WirePlatform(
         let blk = virtio.Block(storage.Image)
         let irqLine = PlatformArm64.VirtioIrqBase + uint32(slot)
         let irq = GicIrq(partition: partition, line: irqLine)
-        let transport = virtio.MmioTransport(blk, memory: ram.Memory, irq: irq)
+        let transport = virtio.MmioTransport(blk, memory: ram.Memory, irq: irq, legacy: cfg.LegacyVirtio)
         let addr = PlatformArm64.VirtioMmioBase + uint64(slot) * PlatformArm64.VirtioMmioStride
         try wired.MmioBus.Insert(transport, at: device.Range(base: addr, count: PlatformArm64.VirtioMmioSize))
         wired.VirtioTransports.append(transport)
@@ -214,20 +230,39 @@ public func WirePlatform(
         let vnet = virtio.Net(port: netRole.Port)
         let irqLine = PlatformArm64.VirtioIrqBase + uint32(slot)
         let irq = GicIrq(partition: partition, line: irqLine)
-        let transport = virtio.MmioTransport(vnet, memory: ram.Memory, irq: irq)
+        let transport = virtio.MmioTransport(vnet, memory: ram.Memory, irq: irq, legacy: cfg.LegacyVirtio)
         let addr = PlatformArm64.VirtioMmioBase + uint64(slot) * PlatformArm64.VirtioMmioStride
         try wired.MmioBus.Insert(transport, at: device.Range(base: addr, count: PlatformArm64.VirtioMmioSize))
         wired.VirtioTransports.append(transport)
         slot += 1
     }
 
+    // Android's battery, always full on mains power.
+    if cfg.Guest == .android {
+        let battery = chipset.GoldfishBattery()
+        try wired.MmioBus.Insert(battery, at: device.Range(base: PlatformArm64.GoldfishBatteryBase, count: PlatformArm64.GoldfishSize))
+        wired.GoldfishBattery = battery
+    }
+
+    // Android's screen: goldfish-fb, pixels in guest RAM.
+    if cfg.Guest == .android && cfg.Display.Enabled {
+        let irq = GicIrq(partition: partition, line: PlatformArm64.GoldfishFbIrq)
+        let fb = display.GoldfishFb(memory: ram.Memory, irq: irq, width: cfg.Display.Width, height: cfg.Display.Height)
+        try wired.MmioBus.Insert(fb, at: device.Range(base: PlatformArm64.GoldfishFbBase, count: PlatformArm64.GoldfishSize))
+        wired.GoldfishFb = fb
+        let evIrq = GicIrq(partition: partition, line: PlatformArm64.GoldfishEventsIrq)
+        let events = chipset.GoldfishEvents(irq: evIrq, width: cfg.Display.Width, height: cfg.Display.Height)
+        try wired.MmioBus.Insert(events, at: device.Range(base: PlatformArm64.GoldfishEventsBase, count: PlatformArm64.GoldfishSize))
+        wired.GoldfishEvents = events
+    }
+
     // 5. Input devices (keyboard and tablet when display is enabled)
-    if cfg.Display.Enabled {
+    if cfg.Display.Enabled && cfg.Guest != .android {
         // 5a. Keyboard input device
         let kbd = virtio.Input(.keyboard)
         let irqLineKbd = PlatformArm64.VirtioIrqBase + uint32(slot)
         let irqKbd = GicIrq(partition: partition, line: irqLineKbd)
-        let transportKbd = virtio.MmioTransport(kbd, memory: ram.Memory, irq: irqKbd)
+        let transportKbd = virtio.MmioTransport(kbd, memory: ram.Memory, irq: irqKbd, legacy: cfg.LegacyVirtio)
         let addrKbd = PlatformArm64.VirtioMmioBase + uint64(slot) * PlatformArm64.VirtioMmioStride
         try wired.MmioBus.Insert(transportKbd, at: device.Range(base: addrKbd, count: PlatformArm64.VirtioMmioSize))
         wired.VirtioTransports.append(transportKbd)
@@ -238,7 +273,7 @@ public func WirePlatform(
         let tablet = virtio.Input(.tablet)
         let irqLineTablet = PlatformArm64.VirtioIrqBase + uint32(slot)
         let irqTablet = GicIrq(partition: partition, line: irqLineTablet)
-        let transportTablet = virtio.MmioTransport(tablet, memory: ram.Memory, irq: irqTablet)
+        let transportTablet = virtio.MmioTransport(tablet, memory: ram.Memory, irq: irqTablet, legacy: cfg.LegacyVirtio)
         let addrTablet = PlatformArm64.VirtioMmioBase + uint64(slot) * PlatformArm64.VirtioMmioStride
         try wired.MmioBus.Insert(transportTablet, at: device.Range(base: addrTablet, count: PlatformArm64.VirtioMmioSize))
         wired.VirtioTransports.append(transportTablet)
@@ -250,7 +285,7 @@ public func WirePlatform(
     let rng = virtio.Rng()
     let irqLineRng = PlatformArm64.VirtioIrqBase + uint32(slot)
     let irqRng = GicIrq(partition: partition, line: irqLineRng)
-    let transportRng = virtio.MmioTransport(rng, memory: ram.Memory, irq: irqRng)
+    let transportRng = virtio.MmioTransport(rng, memory: ram.Memory, irq: irqRng, legacy: cfg.LegacyVirtio)
     let addrRng = PlatformArm64.VirtioMmioBase + uint64(slot) * PlatformArm64.VirtioMmioStride
     try wired.MmioBus.Insert(transportRng, at: device.Range(base: addrRng, count: PlatformArm64.VirtioMmioSize))
     wired.VirtioTransports.append(transportRng)

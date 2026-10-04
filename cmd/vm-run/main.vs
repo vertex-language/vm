@@ -1,11 +1,14 @@
 import (
     "fs"
     "io"
+    "net/nat"
+    "os/env"
     "os/process"
     "sync"
     "time"
     "ui/window"
     "vm"
+    "vm/android"
     "vm/boot"
     "vm/chipset"
     "vm/device"
@@ -20,20 +23,22 @@ Usage: vm-run [options]
 
 Options:
   --kernel <path>    Path to Linux ARM64 kernel Image or vmlinuz (supports raw, gzip, EFI zboot)
-  --initrd <path>    Path to initramfs image (default: testdata/initramfs-virt)
+  --initrd <path>    Path to initramfs image
   --cmdline <str>    Kernel command line arguments
   --memory <MB>      Guest physical memory in MB (default: 512)
   --cpus <N>         Number of virtual CPUs (default: 1)
-  --disk <path>      Path to disk image (raw/qcow2) to attach as VirtIO block device
+  --disk <path>      Path to disk image (raw/qcow2) to attach as VirtIO block device (repeatable: vda, vdb, …)
+  --android <dir>    Boot an Android emulator image (vmimage --clone android:5 <dir>): its kernel, ramdisk and disks
   --cdrom, --iso <p> Path to ISO optical disc image to attach as read-only installer media
   --display, --gui   Open graphical window for guest framebuffer
   --width <px>       Guest framebuffer width (default: 1024)
   --height <px>      Guest framebuffer height (default: 768)
   --screenshot <path> Save guest framebuffer snapshot to PNG file
   --timeout <sec>    Automatically terminate VM after N seconds
-  --firmware <path>  UEFI firmware code (default: Homebrew QEMU's edk2-aarch64-code.fd)
+  --firmware <path>  UEFI firmware code (default: firmware/AAVMF_CODE.secboot.fd.gz, Secure Boot)
   --vars <path>      UEFI variable store template (default: saved beside the disk)
   --disk-size <GB>   Size of a disk --disk creates for Windows (default: 64)
+  --no-tpm           Give a Windows guest no TPM 2.0 (default: swtpm, state beside the disk)
   --net              Enable user-space NAT networking (default: enabled)
   --no-net           Disable networking
   --help, -h         Show this help message
@@ -131,12 +136,13 @@ func evdevCodeFor(_ code: window.KeyCode) -> uint16? {
 public func main() async throws {
     let args = process.Args
 
-    var kernelPath = "testdata/Image"
-    var initrdPath: string? = "testdata/initramfs-virt"
+    var kernelPath = ""
+    var initrdPath: string? = nil
     var cmdline = "console=ttyAMA0 earlycon=pl011,0x09000000 reboot=k panic=-1"
     var memoryMb: uint64 = 512
     var cpus: int = 1
     var diskPath: string? = nil
+    var extraDisks: [string] = []
     var cdromPath: string? = nil
     var enableDisplay = false
     var displayWidth: int = 1024
@@ -155,6 +161,9 @@ public func main() async throws {
     var diskSizeGiB: uint64 = 64
     var explicitMemory = false
     var explicitCpus = false
+    var enableTpm = true
+    var androidDir: string? = nil
+    var explicitSize = false
 
     var i = 1
     while i < args.count {
@@ -199,6 +208,7 @@ public func main() async throws {
             if i + 1 < args.count {
                 if let w = int(args[i + 1]), w > 0 {
                     displayWidth = w
+                    explicitSize = true
                 }
                 i += 1
             }
@@ -206,6 +216,7 @@ public func main() async throws {
             if i + 1 < args.count {
                 if let h = int(args[i + 1]), h > 0 {
                     displayHeight = h
+                    explicitSize = true
                 }
                 i += 1
             }
@@ -257,9 +268,12 @@ public func main() async throws {
             }
         case "--disk":
             if i + 1 < args.count {
-                diskPath = args[i + 1]
+                // Repeatable: the first is vda (and Windows' disk), the rest follow.
+                if diskPath == nil { diskPath = args[i + 1] } else { extraDisks.append(args[i + 1]) }
                 i += 1
             }
+        case "--no-tpm":
+            enableTpm = false
         case "--firmware":
             if i + 1 < args.count {
                 firmwarePath = args[i + 1]
@@ -275,6 +289,11 @@ public func main() async throws {
                 if let g = int(args[i + 1]), g > 0 {
                     diskSizeGiB = uint64(g)
                 }
+                i += 1
+            }
+        case "--android":
+            if i + 1 < args.count {
+                androidDir = args[i + 1]
                 i += 1
             }
         case "--cdrom", "--iso":
@@ -304,6 +323,7 @@ public func main() async throws {
         o.Screenshot = screenshotPath
         o.TimeoutSec = timeoutSec
         o.Display = enableDisplay || screenshotPath == nil
+        o.Tpm = enableTpm
         try await runWindows(o)
         return
     }
@@ -332,8 +352,8 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
     // If an ISO/CD-ROM was attached but no explicit kernel was given, attempt auto-boot
     var kernelBytes: [uint8]? = nil
     var initrdBytes: [uint8]? = nil
-    var kernelDisplayName = kernelPath
-    var initrdDisplayName = initrdPath
+    var kernelDisplayName = kernelPath.isEmpty ? (androidDir.map { $0 + "/kernel-ranchu" } ?? "") : kernelPath
+    var initrdDisplayName = initrdPath ?? androidDir.map { $0 + "/ramdisk.img" }
 
     if let cp = cdromPath, !explicitKernel {
         if let isoFile = try? fs.Open(fs.Path(cp)) {
@@ -378,6 +398,37 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
         }
     }
 
+    // An Android emulator image (a `vmimage --clone android:<release>`
+    // directory): its kernel, ramdisk and disks, a phone-shaped screen.
+    var androidBundle: android.Bundle? = nil
+    if let ad = androidDir {
+        do {
+            let b = try android.Bundle.Open(ad)
+            androidBundle = b
+            kernelPath = b.Kernel
+            initrdPath = b.Ramdisk
+            if !explicitCmdline { cmdline = b.Cmdline() }
+            diskPath = b.Disks[0]
+            extraDisks = Array(b.Disks.dropFirst()) + extraDisks
+            if !explicitMemory { memoryMb = 2048 }
+            if !explicitCpus { cpus = 2 }
+            if !explicitSize {
+                displayWidth = 720
+                displayHeight = 1280
+            }
+            print("[Android] \(b.Release.isEmpty ? "API \(b.ApiLevel)" : "Android \(b.Release) (API \(b.ApiLevel))") from \(b.Dir)")
+        } catch {
+            print("Error: \(error)")
+            return
+        }
+    }
+
+    if kernelBytes == nil && kernelPath.isEmpty {
+        print("Error: no kernel: give --kernel (and --initrd), --iso, or run a container image with `container run`")
+        printUsage()
+        return
+    }
+
     let rawKernel: [uint8]
     if let kb = kernelBytes {
         rawKernel = kb
@@ -415,15 +466,34 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
 
     var cfg = vm.Config(cpus: cpus, memory: memoryMb << 20)
     cfg.Boot = .linux(kernel: kernel, initrd: initrd, cmdline: cmdline)
+    if let (major, minor) = boot.LinuxVersion(kernel), major < 4 {
+        print("[Kernel] Linux \(major).\(minor): VirtIO MMIO devices speak version 1 (legacy)")
+        cfg.LegacyVirtio = true
+    }
     if enableDisplay || screenshotPath != nil {
         cfg.Display = .custom(width: displayWidth, height: displayHeight)
     }
+    if androidBundle != nil {
+        cfg.Guest = .android
+        // Android can't run without a screen (SurfaceFlinger aborts), so
+        // it always has one; --display only decides whether a window shows it.
+        cfg.Display = .custom(width: displayWidth, height: displayHeight)
+    }
     if enableNet {
-        cfg.Network.append(.nat())
+        if androidBundle != nil {
+            // The emulator's network, which Android's init.goldfish.sh
+            // configures statically: 10.0.2.15, gateway .2, DNS .3.
+            cfg.Network.append(.nat(config: nat.NatConfig(
+                gatewayIp: nat.Ipv4Address(10, 0, 2, 2),
+                guestIp: nat.Ipv4Address(10, 0, 2, 15),
+                dnsServers: [nat.Ipv4Address(10, 0, 2, 3)])))
+        } else {
+            cfg.Network.append(.nat())
+        }
     }
 
-    // Optional disk
-    if let dp = diskPath {
+    // Optional disks, in order: vda, vdb, …
+    for dp in (diskPath.map { [$0] } ?? []) + extraDisks {
         do {
             let img = try await vm.OpenDisk(fs.Path(dp))
             cfg.Storage.append(.disk(img))
@@ -452,7 +522,7 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
     }
     print("Memory:     \(memoryMb) MiB")
     print("vCPUs:      \(cpus)")
-    print("Network:    \(enableNet ? "User-space NAT (192.168.127.1, DHCP, DNS)" : "disabled")")
+    print("Network:    \(enableNet ? (androidBundle != nil ? "User-space NAT (guest 10.0.2.15, gateway 10.0.2.2, DNS 10.0.2.3)" : "User-space NAT (192.168.127.1, DHCP, DNS)") : "disabled")")
     print("Display:    \(cfg.Display.Enabled ? "\(cfg.Display.Width)x\(cfg.Display.Height) graphical framebuffer" : "none (headless)")")
     if let sp = screenshotPath {
         print("Screenshot: \(sp)")
@@ -493,6 +563,24 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
         }
     }
 
+    // A debugging aid for Android's touchscreen without a window:
+    // VERTEX_VM_TAP="x,y@seconds;…" taps those screen pixels then.
+    if let taps = env.Get("VERTEX_VM_TAP"), let ev = machine.GoldfishEvents {
+        for t in taps.split(separator: ";") {
+            let parts = t.split(separator: "@")
+            let xy = parts.first.map { $0.split(separator: ",") } ?? []
+            guard parts.count == 2, xy.count == 2, let x = int(string(xy[0])), let y = int(string(xy[1])),
+                  let sec = int(string(parts[1])) else { continue }
+            Task {
+                try? await time.Sleep(.Milliseconds(int64(sec * 1000)))
+                print("\n[Host] tap \(x),\(y)")
+                ev.Touch(x: x, y: y, down: true)
+                try? await time.Sleep(.Milliseconds(80))
+                ev.Touch(x: x, y: y, down: false)
+            }
+        }
+    }
+
     // If screenshot requested, schedule capture after delay
     if let sp = screenshotPath {
         Task {
@@ -512,10 +600,22 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
     if let ts = timeoutSec {
         Task {
             try? await time.Sleep(.Milliseconds(int64(ts * 1000)))
+            if env.Get("VERTEX_VM_DUMP") != nil {
+                for v in machine.Vcpus {
+                    let (_, _, st) = v.CurrentState()
+                    print("\n[vCPU \(v.Id) at timeout] \(st)")
+                }
+            }
             if let sp = screenshotPath {
                 try? machine.Framebuffer?.SavePNG(to: fs.Path(sp))
             }
             machine.Terminate()
+            if enableDisplay {
+                // The window's event loop would keep the process alive.
+                _ = try? await machine.Wait()
+                print("\nVM exited: timeout")
+                process.Exit(0)
+            }
         }
     }
 
@@ -524,15 +624,23 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
         let fbH = float32(cfg.Display.Height)
         var options = window.Options()
         options.Resizable = true
-        options.MinSize = window.Size(640, 480)
-        let initialW: float32 = max(fbW, 1024)
-        let initialH: float32 = max(fbH, 768)
-        let w = try window.Create(title: "Vertex VM — Ubuntu Desktop (ARM64)", size: window.Size(initialW, initialH), options: options)
+        options.MinSize = fbH > fbW ? window.Size(240, 400) : window.Size(640, 480)
+        var initialW: float32 = max(fbW, 1024)
+        var initialH: float32 = max(fbH, 768)
+        if fbH > fbW {
+            // A phone: its own shape, no taller than a laptop screen holds.
+            initialH = min(fbH, 900)
+            initialW = fbW * initialH / fbH
+        }
+        let title = androidBundle.map { "Vertex VM — Android " + ($0.Release.isEmpty ? "API \($0.ApiLevel)" : $0.Release) } ?? "Vertex VM — Ubuntu Desktop (ARM64)"
+        let w = try window.Create(title: title, size: window.Size(initialW, initialH), options: options)
         let surface = w.Surface()
         surface.SetScaling(.aspectFit)
         w.RequestFrame()
 
         var currentSize = window.Size(initialW, initialH)
+        var lastFrames: uint64 = ~0
+        var lastPresent = time.Instant.Now()
 
         func mapPointerToTablet(_ pos: window.Point) -> (int32, int32)? {
             let scale = min(currentSize.Width / fbW, currentSize.Height / fbH)
@@ -550,6 +658,12 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
             let absX = int32(normX * 32767.0)
             let absY = int32(normY * 32767.0)
             return (absX, absY)
+        }
+
+        /// The screen pixel under the pointer, for Android's touchscreen.
+        func mapPointerToScreen(_ pos: window.Point) -> (int, int)? {
+            guard let (ax, ay) = mapPointerToTablet(pos) else { return nil }
+            return (int(float32(ax) / 32767.0 * fbW), int(float32(ay) / 32767.0 * fbH))
         }
 
         print("[Host GUI] Window open. Controls: [Cmd+S] screenshot, [Cmd+Q/W] exit, mouse & keyboard active.")
@@ -571,11 +685,24 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
                 w.RequestFrame()
 
             case .pointerMoved(let ptr):
+                if let ev = machine.GoldfishEvents {
+                    if ev.Touching, let (x, y) = mapPointerToScreen(ptr.Position) { ev.Touch(x: x, y: y, down: true) }
+                    continue
+                }
                 if let (absX, absY) = mapPointerToTablet(ptr.Position) {
                     machine.TabletInput?.MoveAbsolute(x: absX, y: absY)
                 }
 
             case .pointerDown(let ptr, let btn):
+                if let ev = machine.GoldfishEvents {
+                    if btn == .secondary {
+                        ev.Key(158, pressed: true)   // KEY_BACK
+                        ev.Key(158, pressed: false)
+                    } else if let (x, y) = mapPointerToScreen(ptr.Position) {
+                        ev.Touch(x: x, y: y, down: true)
+                    }
+                    continue
+                }
                 if let (absX, absY) = mapPointerToTablet(ptr.Position) {
                     machine.TabletInput?.MoveAbsolute(x: absX, y: absY)
                 }
@@ -589,6 +716,13 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
                 machine.TabletInput?.Button(button: buttonCode, pressed: true)
 
             case .pointerUp(let ptr, let btn):
+                if let ev = machine.GoldfishEvents {
+                    if ev.Touching {
+                        let (x, y) = mapPointerToScreen(ptr.Position) ?? (0, 0)
+                        ev.Touch(x: x, y: y, down: false)
+                    }
+                    continue
+                }
                 if let (absX, absY) = mapPointerToTablet(ptr.Position) {
                     machine.TabletInput?.MoveAbsolute(x: absX, y: absY)
                 }
@@ -625,6 +759,14 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
                         }
                         continue
                     }
+                }
+
+                // Android: its keyboard; Home and Escape are its Home and Back keys.
+                if let ev = machine.GoldfishEvents {
+                    if k.Code == .home { ev.Key(102, pressed: true) }          // KEY_HOME
+                    else if k.Code == .escape { ev.Key(158, pressed: true) }   // KEY_BACK
+                    else if let evdev = evdevCodeFor(k.Code), !k.Repeat { ev.Key(evdev, pressed: true) }
+                    continue
                 }
 
                 // 1. Forward evdev key to guest keyboard (for graphical / fbcon console)
@@ -696,19 +838,37 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
                 }
 
             case .keyUp(let k):
+                if let ev = machine.GoldfishEvents {
+                    if k.Code == .home { ev.Key(102, pressed: false) }
+                    else if k.Code == .escape { ev.Key(158, pressed: false) }
+                    else if let evdev = evdevCodeFor(k.Code) { ev.Key(evdev, pressed: false) }
+                    continue
+                }
                 if let evdev = evdevCodeFor(k.Code) {
                     machine.KeyboardInput?.Key(code: evdev, pressed: false)
                 }
 
             case .text(let s):
+                if machine.GoldfishEvents != nil { continue }
                 if s != "\r" && s != "\n" {
                     machine.ConsoleUart?.Feed([uint8](s.utf8))
                 }
 
             case .frame(_):
-                let snap = try? machine.Framebuffer?.Snapshot()
-                if let s = snap, !s.isEmpty {
-                    try? surface.Present(s, size: window.PixelSize(int32(fbW), int32(fbH)))
+                // Redraw when the guest posted a frame, or now and then
+                // for screens drawn in place; converting the screen on
+                // every host frame starves the device tasks this thread
+                // also runs (a guest's disk I/O among them).
+                if let fb = machine.Framebuffer {
+                    let frames = fb.Frames
+                    let since = lastPresent.Elapsed().AsMilliseconds()
+                    if frames != lastFrames || since >= (frames == 0 ? 33 : 500) {
+                        lastFrames = frames
+                        lastPresent = time.Instant.Now()
+                        if let s = try? fb.Snapshot(), !s.isEmpty {
+                            try? surface.Present(s, size: window.PixelSize(int32(fbW), int32(fbH)))
+                        }
+                    }
                 }
                 w.RequestFrame()
 

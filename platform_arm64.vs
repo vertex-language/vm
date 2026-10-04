@@ -44,6 +44,18 @@ public struct PlatformArm64 {
     public static let FbBase: uint64           = 0x3000_0000
     public static let FbSize: uint64           = 0x0080_0000 // 8 MiB
 
+    /// A TPM's TIS registers, 5 localities of 4 KiB.
+    public static let TpmBase: uint64          = 0x0c00_0000
+
+    /// The Android emulator's devices (Guest.android).
+    public static let GoldfishFbBase: uint64     = 0x0904_0000
+    public static let GoldfishFbIrq: uint32      = 8 // SPI 8
+    public static let GoldfishEventsBase: uint64 = 0x0905_0000
+    public static let GoldfishEventsIrq: uint32  = 9 // SPI 9
+    public static let GoldfishBatteryBase: uint64 = 0x0906_0000
+    public static let GoldfishBatteryIrq: uint32  = 10 // SPI 10
+    public static let GoldfishSize: uint64       = 0x0000_1000
+
     public static let FwCfgBase: uint64        = 0x0902_0000
     public static let FwCfgSize: uint64        = 0x0000_1000
 
@@ -88,7 +100,11 @@ extension PlatformArm64 {
         framebuffer: FramebufferConfig? = nil,
         enableFwCfg: bool = false,
         enableFlash: bool = false,
-        enablePci: bool = false
+        enablePci: bool = false,
+        enableTpm: bool = false,
+        goldfishFb: bool = false,
+        goldfishEvents: bool = false,
+        goldfishBattery: bool = false
     ) -> [uint8] {
         let tree = fdt.Tree()
 
@@ -194,6 +210,13 @@ extension PlatformArm64 {
             fwcfg.AddEmptyProperty("dma-coherent")
         }
 
+        // TPM 2.0, TIS over MMIO: what EDK2's Tpm2DeviceLib looks for.
+        if enableTpm {
+            let tpm = tree.Root.AddChild("tpm@\(string(TpmBase, radix: 16))")
+            tpm.AddProperty("compatible", "tcg,tpm-tis-mmio")
+            tpm.AddProperty("reg", u64s: [TpmBase, 0x5000])
+        }
+
         // CFI Flash node
         if enableFlash {
             let flash = tree.Root.AddChild("flash@0")
@@ -243,6 +266,27 @@ extension PlatformArm64 {
             vdev.AddProperty("reg", u64s: [addr, VirtioMmioSize])
             vdev.AddProperty("interrupt-parent", uint32(1))
             vdev.AddProperty("interrupts", u32s: [0, irqLine, 4])
+        }
+
+        // The Android emulator's screen and input.
+        if goldfishFb {
+            let n = tree.Root.AddChild("goldfish_fb@\(string(GoldfishFbBase, radix: 16))")
+            n.AddProperty("compatible", "generic,goldfish-fb")
+            n.AddProperty("reg", u64s: [GoldfishFbBase, GoldfishSize])
+            n.AddProperty("interrupts", u32s: [0, GoldfishFbIrq, 4])
+        }
+        if goldfishEvents {
+            let n = tree.Root.AddChild("goldfish_events@\(string(GoldfishEventsBase, radix: 16))")
+            n.AddProperty("compatible", "generic,goldfish-events-keypad")
+            n.AddProperty("reg", u64s: [GoldfishEventsBase, GoldfishSize])
+            n.AddProperty("interrupts", u32s: [0, GoldfishEventsIrq, 4])
+        }
+
+        if goldfishBattery {
+            let n = tree.Root.AddChild("goldfish_battery@\(string(GoldfishBatteryBase, radix: 16))")
+            n.AddProperty("compatible", "generic,goldfish-battery")
+            n.AddProperty("reg", u64s: [GoldfishBatteryBase, GoldfishSize])
+            n.AddProperty("interrupts", u32s: [0, GoldfishBatteryIrq, 4])
         }
 
         // simple-framebuffer device

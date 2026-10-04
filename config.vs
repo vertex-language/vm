@@ -27,6 +27,9 @@ public enum Guest {
     case linux
     case windows
     case bsd
+    /// Android on the emulator's goldfish devices ("ranchu"): a
+    /// goldfish-fb screen and goldfish-events input instead of the VirtIO ones.
+    case android
     case other
 }
 
@@ -90,6 +93,12 @@ public struct NetworkRole {
     }
 }
 
+/// A TPM 2.0 for the guest.
+public enum TpmRole {
+    /// swtpm, keeping the TPM's state (its seeds, NV, keys) in `stateDir`.
+    case swtpm(stateDir: string)
+}
+
 /// Virtual machine configuration by role.
 public struct Config {
     public var Cpus: int
@@ -101,6 +110,12 @@ public struct Config {
     public var Network: [NetworkRole] = []
     public var Console: ConsoleRole = .stdio
     public var Display: DisplayRole = .none
+    /// A TPM 2.0 (UEFI boots only: firmware and OS find it by DTB and ACPI).
+    public var Tpm: TpmRole? = nil
+    /// VirtIO MMIO devices speak version 1 (legacy) rather than 2: for
+    /// Linux before 4.0, whose virtio_mmio knows no other (Android 5–7's
+    /// emulator kernels). See boot.LinuxVersion.
+    public var LegacyVirtio: bool = false
 
     public init(cpus: int = 1, memory: uint64 = 1024 << 20) {
         Cpus = cpus

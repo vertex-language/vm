@@ -36,6 +36,11 @@ public func DetectKernelFormat(_ data: [uint8]) -> KernelFormat {
     if data.count >= 2 && data[0] == 0x1f && data[1] == 0x8b {
         return .gzip
     }
+    // Linux's EFI zboot header is at the start of the file: "MZ", then
+    // "zimg", the payload's offset and size, and the compression's name.
+    if let comp = zimgCompression(data, at: 0) {
+        return .efiZboot(compression: comp)
+    }
     if data.count >= 64 && data[0] == 0x4d && data[1] == 0x5a { // "MZ"
         let peOffset = int(binary.LittleEndian.Uint32(data, from: 0x3c))
         if peOffset + 24 <= data.count &&
@@ -73,6 +78,42 @@ public func DetectKernelFormat(_ data: [uint8]) -> KernelFormat {
         }
     }
     return .unknown
+}
+
+/// The compression a zboot header at `base` names ("gzip", "zstd"), or
+/// nil where there is no header there.
+func zimgCompression(_ data: [uint8], at base: int) -> string? {
+    guard base + 0x38 <= data.count, data[base + 4] == 0x7a, data[base + 5] == 0x69,
+          data[base + 6] == 0x6d, data[base + 7] == 0x67 else { return nil }
+    var comp = [uint8]()
+    for j in 0..<32 {
+        let b = data[base + 0x18 + j]
+        if b == 0 { break }
+        comp.append(b)
+    }
+    return String(decoding: comp, as: UTF8.self)
+}
+
+/// The Image inside a zboot header at `base`: its payload, decompressed.
+func unpackZimg(_ data: [uint8], at base: int, _ comp: string) async throws -> [uint8] {
+    let start = base + int(binary.LittleEndian.Uint32(data, from: base + 8))
+    let end = start + int(binary.LittleEndian.Uint32(data, from: base + 12))
+    guard start < end && end <= data.count else {
+        throw BootError.badImage("corrupted EFI zboot payload offsets")
+    }
+    let payload = [uint8](data[start..<end])
+    var decomp: [uint8]
+    if comp == "gzip" {
+        decomp = try gzip.Decompress(payload)
+    } else if comp == "zstd" {
+        decomp = try await decompressZstd(payload)
+    } else {
+        throw BootError.unsupported("EFI zboot compression algorithm '\(comp)'")
+    }
+    if decomp.count >= 64 && binary.LittleEndian.Uint32(decomp, from: 0x38) == arm64Magic {
+        return decomp
+    }
+    throw BootError.badImage("decompressed EFI zboot payload does not contain ARM64 Image magic")
 }
 
 func findZstdExecutable() -> string {
@@ -124,6 +165,9 @@ public func UnpackKernel(_ data: [uint8]) async throws -> [uint8] {
         throw BootError.badImage("decompressed gzip payload does not contain ARM64 Image magic")
 
     case .efiZboot(let comp):
+        if zimgCompression(data, at: 0) != nil {
+            return try await unpackZimg(data, at: 0, comp)
+        }
         let peOffset = int(binary.LittleEndian.Uint32(data, from: 0x3c))
         let numSections = int(binary.LittleEndian.Uint16(data, from: peOffset + 6))
         let optHdrSize = int(binary.LittleEndian.Uint16(data, from: peOffset + 20))

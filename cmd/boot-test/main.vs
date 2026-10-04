@@ -10,6 +10,7 @@ import (
     "vm/device"
     "vm/disk"
     "vm/usb"
+    "vm/windows"
     "vm/hypervisor"
 )
 
@@ -48,45 +49,6 @@ func runTinyGuest() async throws {
     } else {
         print("FAIL: Expected output to contain 'HELLO', got: '\(output)'")
     }
-}
-
-func runAlpineLinux() async throws {
-    let kernelPath = fs.Path("testdata/Image")
-    let kernelFile = try fs.Open(kernelPath)
-    print("Reading Linux ARM64 kernel from testdata/Image...")
-    let kernel = try kernelFile.ReadToEnd()
-    print("Kernel read: \(kernel.count) bytes")
-
-    var initrd: [uint8]? = nil
-    let initrdPath = fs.Path("testdata/initramfs-virt")
-    if let initrdFile = try? fs.Open(initrdPath) {
-        print("Reading Alpine initramfs from testdata/initramfs-virt...")
-        initrd = try? initrdFile.ReadToEnd()
-        if let rd = initrd {
-            print("Initramfs read: \(rd.count) bytes")
-        }
-    }
-
-    print("=== Test 2: Booting Alpine Linux ARM64 Kernel ===")
-    var cfg = vm.Config(cpus: 1, memory: 512 << 20)
-    cfg.Boot = .linux(
-        kernel: kernel,
-        initrd: initrd,
-        cmdline: "console=ttyAMA0 earlycon=pl011,0x09000000 reboot=k panic=-1"
-    )
-
-    let machine = try vm.Create(cfg, consoleWriter: vm.StdioWriter())
-    defer { machine.Close() }
-    try machine.Start()
-    print("Alpine Linux VM started! Streaming guest console:")
-    Task {
-        try? await Task.sleep(nanoseconds: 1_000_000_000)
-        print("\n[boot-test] Kernel booted into userland, terminating test cleanly...")
-        machine.Terminate()
-    }
-    let code = try await machine.Wait()
-    print("\n[boot-test] Alpine Linux boot test completed successfully (code: \(code))")
-    print("=== ALL BOOT TESTS PASSED ===")
 }
 
 /// Executes `mrs x8, pmcr_el0`, then PSCI SYSTEM_OFF: shows whether the
@@ -171,23 +133,18 @@ func dumpAcpi(_ machine: vm.Machine) {
 }
 
 func runEfiFirmware() async throws {
-    let efiPath = fs.Path("/opt/homebrew/share/qemu/edk2-aarch64-code.fd")
-    guard let efiFile = try? fs.Open(efiPath) else {
-        print("Skipping EFI test (edk2-aarch64-code.fd not found)")
-        return
+    // The bundled Secure Boot firmware, unless `fw=<code.fd>` and
+    // `vars=<vars.fd>` pick other firmware.
+    var codeArg: string? = nil
+    var varsArg: string? = nil
+    for a in process.Args {
+        if a.hasPrefix("fw=") { codeArg = string(a.dropFirst(3)) }
+        if a.hasPrefix("vars=") { varsArg = string(a.dropFirst(5)) }
     }
-    defer { try? efiFile.Close() }
-    print("=== Test 3: Booting EDK2 AArch64 UEFI Firmware ===")
-    let firmware = try efiFile.ReadToEnd()
-    print("Read UEFI firmware: \(firmware.count) bytes")
-
-    var vars: [uint8]? = nil
-    let varsPath = fs.Path("/opt/homebrew/share/qemu/edk2-arm-vars.fd")
-    if let varsFile = try? fs.Open(varsPath) {
-        vars = try? varsFile.ReadToEnd()
-        print("Read UEFI vars: \(vars?.count ?? 0) bytes")
-        try? varsFile.Close()
-    }
+    let fw = try windows.FindFirmware(customCodePath: codeArg, customVarsPath: varsArg)
+    print("=== Test 3: Booting UEFI firmware \(fw.Name) (Secure Boot \(fw.SecureBoot ? "on" : "off")) ===")
+    let firmware = fw.Code
+    let vars: [uint8]? = fw.VarsTemplate
 
     var cfg = vm.Config(cpus: 2, memory: 4096 << 20)
     cfg.Boot = .efi(firmware: firmware, vars: vars)
@@ -204,6 +161,9 @@ func runEfiFirmware() async throws {
     let targetPath = fs.Path("testdata/windows-target.raw")
     let target = (try? disk.OpenRaw(targetPath)) ?? (try disk.CreateRaw(targetPath, size: 64 << 30))
     cfg.Storage.append(.disk(target))
+    if !process.Args.contains("no-tpm") {
+        cfg.Tpm = .swtpm(stateDir: "testdata/windows-target.tpm")
+    }
 
     let machine = try vm.Create(cfg, consoleWriter: vm.StdioWriter())
     defer { machine.Close() }
@@ -270,6 +230,9 @@ func runEfiFirmware() async throws {
                         }
                     }
                 }
+            }
+            if sec % 10 == 0, let t = machine.Wired.Tpm {
+                print("[boot-test] [\(sec)s] TPM commands: \(t.CommandCount)")
             }
             if sec % 10 == 0 {
                 if let fb = machine.Framebuffer, fb.Configured {

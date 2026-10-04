@@ -3,6 +3,7 @@ import (
     "ui/window"
     "vm"
     "vm/disk"
+    "vm/tpm"
     "vm/windows"
 )
 
@@ -18,6 +19,7 @@ struct WindowsOptions {
     var Screenshot: string? = nil
     var TimeoutSec: int? = nil
     var Display = true
+    var Tpm = true
 }
 
 /// The HID usage (page 7) of a host key, for the guest's USB keyboard.
@@ -72,6 +74,12 @@ func hidUsageFor(_ code: window.KeyCode) -> uint8? {
     }
 }
 
+func readAll(_ path: string) -> [uint8]? {
+    guard let f = try? fs.Open(fs.Path(path)) else { return nil }
+    defer { try? f.Close() }
+    return try? f.ReadToEnd()
+}
+
 /// Where a disk's EFI variables are kept between runs: beside it.
 func varsPath(for diskPath: string) -> string {
     diskPath + ".efivars"
@@ -89,24 +97,49 @@ func runWindows(_ o: WindowsOptions) async throws {
         print("[Windows] Creating \(o.DiskSize >> 30) GiB disk: \(diskPath)")
         target = try disk.CreateRaw(fs.Path(diskPath), size: o.DiskSize)
     }
-    // Nothing installed yet: no partition table in sector 0 or 1.
+    // Nothing installed yet: no partition table -- no MBR boot signature
+    // in sector 0, no GPT header in sector 1. (Setup stamps a disk
+    // signature into an empty disk's sector 0 when it looks at it, so
+    // "all zeroes" is not the test.)
     var head = [uint8](repeating: 0, count: 1024)
     try? await target.ReadAt(0, into: &head)
-    let blank = head.allSatisfy { $0 == 0 }
+    let mbr = head[510] == 0x55 && head[511] == 0xaa
+    let gpt = Array(head[512..<520]) == Array("EFI PART".utf8)
+    let blank = !mbr && !gpt
 
-    // EFI variables saved from the last run win over the template.
-    var vars = o.Vars
+    // The firmware, and the variable store saved beside the disk last
+    // time -- if the same firmware wrote it. A store from other firmware
+    // lacks this one's keys, so it starts again from the template.
+    let fw = try windows.FindFirmware(customCodePath: o.Firmware, customVarsPath: o.Vars)
     let saved = varsPath(for: diskPath)
-    if vars == nil && (try? fs.Open(fs.Path(saved))) != nil {
-        vars = saved
+    let savedFor = saved + ".firmware"
+    var savedVars: [uint8]? = nil
+    if let bytes = readAll(saved) {
+        let owner = string(decoding: readAll(savedFor) ?? [], as: UTF8.self)
+        if owner == fw.Name {
+            savedVars = bytes
+        } else {
+            print("[Windows] \(saved) is from other firmware; starting a fresh variable store for \(fw.Name)")
+        }
+    }
+    // The TPM's state lives beside the disk, so Windows finds the same TPM
+    // -- and the keys it sealed to it -- every boot.
+    var tpmDir: string? = nil
+    if o.Tpm {
+        if tpm.Swtpm.Available() {
+            tpmDir = diskPath + ".tpm"
+        } else {
+            print("[Windows] swtpm not found (brew install swtpm): booting without a TPM")
+        }
     }
     var cfg = try await windows.ConfigureVm(
         isoPath: o.Iso,
         vcpus: o.Cpus,
         memoryMiB: o.MemoryMiB,
         targetDisk: target,
-        customCodePath: o.Firmware,
-        customVarsPath: vars
+        firmware: fw,
+        savedVars: savedVars,
+        tpmStateDir: tpmDir
     )
     if !o.Display && o.Screenshot == nil {
         cfg.Display = .none
@@ -115,7 +148,9 @@ func runWindows(_ o: WindowsOptions) async throws {
     print("=== Launching Windows (ARM64, UEFI) ===")
     print("ISO:        \(o.Iso) (USB CD-ROM)")
     print("Disk:       \(diskPath) (NVMe, \(target.Size >> 30) GiB)")
+    print("Firmware:   \(fw.Name)\(fw.SecureBoot ? " (Secure Boot on, Microsoft keys)" : " (no Secure Boot)")")
     print("EFI vars:   \(saved)")
+    print("TPM:        \(tpmDir.map { "TPM 2.0 (swtpm), state in \($0)" } ?? "none")")
     print("Memory:     \(o.MemoryMiB) MiB")
     print("vCPUs:      \(max(2, o.Cpus))")
     print("Network:    none (Windows has no inbox driver for VirtIO net)")
@@ -130,18 +165,28 @@ func runWindows(_ o: WindowsOptions) async throws {
         guard let bytes = machine.Pflash?.Bytes, let f = try? fs.Create(fs.Path(saved)) else { return }
         try? f.Write(bytes)
         try? f.Close()
+        if let owner = try? fs.Create(fs.Path(savedFor)) {
+            try? owner.Write([uint8](fw.Name.utf8))
+            try? owner.Close()
+        }
     }
 
     if blank {
         // The installer's boot loader asks for a key before it boots from
-        // the CD, and with none falls through to the empty disk.
-        print("[Windows] Blank disk: pressing a key for the installer's \"Press any key to boot from CD\"")
+        // the CD, and with none falls through to the empty disk. It draws
+        // the prompt on the screen only, so the key is tapped once a
+        // second until Windows' own USB driver has the controller (it
+        // turns MSI-X on; firmware never does). Keys before that reach only
+        // firmware and the boot loader, and Windows resets each port when
+        // its driver starts, which drops any still queued.
+        print("[Windows] No partition table on the disk: pressing a key for the installer's \"Press any key to boot from CD\"")
         Task {
-            try? await Task.sleep(nanoseconds: 3_000_000_000)   // past the firmware's own prompt
-            for _ in 0..<12 {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            try? await Task.sleep(nanoseconds: 2_000_000_000)   // past the firmware's own prompt
+            for _ in 0..<120 {
+                if machine.Wired.Xhci?.Config.MsixEnabled ?? true { break }
                 machine.UsbKeyboard?.Key(0x2c, pressed: true)
                 machine.UsbKeyboard?.Key(0x2c, pressed: false)
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
         }
     }

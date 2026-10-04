@@ -55,6 +55,8 @@ Zero instruction emulation. Zero QEMU or libvirt dependencies. 100% native CPU a
 | **`vm/pci`** | **Production** | PCIe root complex: ECAM configuration space with writable masks, BARs decoded where the guest programs them (`Root.MmioWindow`), MSI-X (delivered through the GIC's MSI frame), level-triggered INTx swizzled onto SPIs 3–6, and a PCIe capability. |
 | **`vm/nvme`** | **Production** | NVMe 1.4 controller on MSI-X or INTx: admin and I/O queue pairs, Identify, features, log pages, read/write/flush/write zeroes/deallocate, chained PRP lists. Windows' `stornvme` drives it inbox. |
 | **`vm/usb`** | **Production** | xHCI controller with a USB 2.0 root hub: command and event rings, slots and endpoint contexts, control/bulk/interrupt transfers. Devices: HID keyboard and tablet, and bulk-only mass storage as a CD-ROM (SCSI/MMC) or disk. |
+| **`vm/tpm`** | **Production** | TPM 2.0: the TIS / FIFO register interface over MMIO (QEMU's state machine), found by firmware through the DTB (`tcg,tpm-tis-mmio`) and by Windows through ACPI (`MSFT0101` and the `TPM2` table), in front of a `Backend`; today `Swtpm`, the swtpm process over Unix sockets, with its state kept beside the disk. |
+| **`vm/android`** | **Working** | Android emulator system images (Google's AOSP builds, no Google services, pulled with [`vmimage`](../vmimage)): reads a bundle's API level, kernel, ramdisk and disk order, and the kernel command line the emulator's "ranchu" board gives. Android 5–7.1 (API 21–25). |
 | **`vm/windows`** | **Production** | Windows ARM64 ISO detection, EDK2 firmware lookup, and the machine configuration Windows installs on. |
 | **`vm/disk`** | **Production** | Disk backend protocol (`Image`), raw disk driver, pure-Vertex ISO 9660 filesystem parser (`disk/iso.vs` with PVD, El Torito, directory reader, boot file discovery, and chunked extraction), QCOW2 reader (`disk/qcow2`), and VHDX reader (`disk/vhdx`). |
 
@@ -62,7 +64,7 @@ Zero instruction emulation. Zero QEMU or libvirt dependencies. 100% native CPU a
 
 ## 3. Included CLI Programs
 
-The repository includes four executable tools in `cmd/`:
+The repository includes five executable tools in `cmd/`:
 
 ### 1. `vm-run` (`cmd/vm-run`)
 Interactive virtual machine runner supporting headless microVMs, graphical desktop live ISOs, and automated distribution installers.
@@ -83,7 +85,7 @@ Comprehensive disk and ISO management utility:
 - `convert <source> <dest>`: Converts/copies disk images to raw disk images.
 
 ### 3. `check` (`cmd/check`)
-Offline test suite with 149 passing verification checks covering all device models (VirtIO, PCI, NVMe, xHCI, USB storage), FDT and ACPI generation, network packet parsers, ISO 9660 directory structures, and kernel decompressors without requiring hypervisor permissions.
+Offline test suite with 182 passing verification checks covering all device models (VirtIO, PCI, NVMe, xHCI, USB storage), FDT and ACPI generation, network packet parsers, ISO 9660 directory structures, and kernel decompressors without requiring hypervisor permissions.
 
 ### 4. `boot-test` (`cmd/boot-test`)
 Live hypervisor integration test suite executing bare-metal machine cycles, direct kernel boots and a UEFI boot of a Windows ARM64 ISO against Apple's `Hypervisor.framework`. `./boot-test pmu` checks that PMU registers work under the in-kernel GIC; `./boot-test trace-late` traces xHCI and SCSI traffic once Windows has taken over.
@@ -97,7 +99,7 @@ Live hypervisor integration test suite executing bare-metal machine cycles, dire
 On macOS, binaries using `Hypervisor.framework` require the `com.apple.security.hypervisor` entitlement:
 
 ```bash
-# 1. Run offline verification suite (149 checks)
+# 1. Run offline verification suite (182 checks)
 vsc run ./cmd/check
 
 # 2. Build and sign the VM runner
@@ -111,8 +113,8 @@ vsc build -o ./disk-tool ./cmd/disk
 ### Running Virtual Machines
 
 ```bash
-# Direct boot an Alpine Linux microVM (headless terminal mode)
-./vm-run --kernel testdata/Image --initrd testdata/initramfs-virt
+# Boot a Linux microVM directly from a kernel and initramfs
+./vm-run --kernel testdata/debian/linux --initrd testdata/debian/initrd.gz
 
 # Direct one-click boot a Debian Installer ISO (text mode)
 ./vm-run --iso testdata/debian/mini.iso
@@ -128,13 +130,19 @@ vsc build -o ./disk-tool ./cmd/disk
 
 # Install Windows 11 ARM64 from its ISO onto a 64 GiB NVMe disk (created if missing)
 ./vm-run --iso Windows11_Client_arm64_en-us_26300_9457.iso --disk windows.raw
+
+# Android 5.0 (AOSP, no Google services), from Google's emulator image
+vmimage --pull android:5 && vmimage --clone android:5 testdata/android/api21
+./vm-run --android testdata/android/api21 --display
 ```
 
 ### Windows ARM64
 
 A Windows ARM64 ISO is recognised by its volume ID and boots under UEFI
-(EDK2's `edk2-aarch64-code.fd`, from Homebrew's `qemu` or `--firmware`)
-on hardware Windows drives with inbox drivers:
+with Secure Boot on: the EDK2 build and Microsoft-key variable store in
+[`firmware/`](firmware/README.md) (Ubuntu's AAVMF, as libvirt uses), or
+`--firmware`; without `firmware/`, Homebrew QEMU's EDK2 with Secure Boot
+off. It runs on hardware Windows drives with inbox drivers:
 
 | Guest sees | Device | Windows driver |
 | :--- | :--- | :--- |
@@ -142,12 +150,47 @@ on hardware Windows drives with inbox drivers:
 | the disk | NVMe namespace | `stornvme` |
 | keyboard and mouse | USB HID keyboard and absolute tablet | `kbdhid`, `mouhid` |
 | the screen | ramfb, as UEFI GOP | Basic Display |
+| TPM 2.0 | TIS over MMIO, backed by swtpm (`brew install swtpm`); state in `windows.raw.tpm/` | `tpm.sys` |
 | interrupts, CPUs, timers | GICv3 with an MSI frame (MSI-X for NVMe and xHCI), PSCI over HVC, generic timer, via ACPI | inbox HAL |
 
 The EFI variable store is saved beside the disk (`windows.raw.efivars`)
-when the VM exits, so the boot entries Setup writes survive. Cmd+Q
+when the VM exits, so the boot entries Setup writes survive, and the TPM's
+state lives in `windows.raw.tpm/`, so the guest sees the same TPM every
+boot (`--no-tpm` leaves it out). A variable store is only reused by the
+firmware that wrote it (`windows.raw.efivars.firmware` says which), so
+switching firmware starts a fresh one with that firmware's keys. Cmd+Q
 closes the VM; Cmd on its own is the Windows key. There is no network
 yet: Windows has no inbox driver for virtio-net.
+
+### Android
+
+`--android <dir>` boots one of Google's Android emulator system images: plain
+AOSP, `eng` builds with no Google services, the smallest 201 MB (Android 5.0,
+API 21). [`vmimage`](../vmimage) pulls and checks them (`vmimage --pull
+android:5`) and `vmimage --clone android:5 <dir>` makes a directory of the
+image's own to boot and change: `kernel-ranchu`, `ramdisk.img`, and the
+`system.img`, `cache.img` and `userdata.img` disks.
+
+vm presents the emulator's "ranchu" board, the devices its goldfish kernels
+(Linux 3.18 for Android 5–7) drive:
+
+| Guest sees | Device | Notes |
+| :--- | :--- | :--- |
+| /system, /cache, /data | VirtIO block over MMIO, **version 1 (legacy)** | Linux before 4.0 has no other; chosen when the kernel's version string says so (`Config.LegacyVirtio`) |
+| /dev/graphics/fb0 | `goldfish-fb`: RGB565 in guest RAM, flipped by SET_BASE | always present (SurfaceFlinger aborts without one); `--display` shows it, 720×1280 unless `--width`/`--height` |
+| touchscreen and keyboard | `goldfish-events`, named `qwerty2` | the image's `qwerty2.idc` makes it a touchscreen; click to touch, right-click or Esc is Back, Home is Home |
+| battery | `goldfish-battery` | always full on mains; without it Android 5's BatteryService fails the system server's first start |
+| eth0 | VirtIO net (legacy) on vm's NAT | at the emulator's addresses: guest 10.0.2.15, gateway 10.0.2.2, DNS 10.0.2.3 |
+| console | PL011 `ttyAMA0` | a shell (`shell@generic_arm64`); `su` for root |
+| interrupts | GICv3, every interrupt put in Group 1 before a direct boot | as firmware (or QEMU) would: Linux 3.18 leaves them in Group 0, which the GIC signals as FIQs it never takes |
+
+It boots to the launcher in about a minute (software rendering:
+`qemu.gles=0`), SELinux permissive. Not yet: DNS and connectivity for apps
+(Android 5 gets its default network from the emulator's modem, RIL over a
+goldfish pipe; IP works, `su 0 ping 1.1.1.1`), the navigation bar (the
+emulator turns it on through its qemud boot properties), sound, and Android
+8 and later (a vendor partition, verified-boot metadata, and goldfish pipes
+for graphics).
 
 ### Inspecting and Extracting ISO Images
 
@@ -219,6 +262,13 @@ The core microVM engine, direct Linux boot, ISO auto-boot, user-space networking
 - [x] **UEFI Firmware Boot Path**: EDK2 in two flash banks, ACPI through fw_cfg's table loader, ramfb.
 - [x] **NVMe Controller Model (`vm/nvme`)**
 - [x] **USB xHCI Controller (`vm/usb`)**
+- [x] **TPM 2.0 (`vm/tpm`)**, on swtpm.
+- [ ] **A TPM 2.0 engine of Vertex's own**, behind `tpm.Backend`, so swtpm isn't needed.
+- [x] **Secure Boot**: Secure Boot firmware with Microsoft's keys enrolled (`firmware/`).
+- [x] **Container images as VMs**: moved to [`container`](../container) (`container run`, `container build`), which owns images-as-containers; `vm` only boots machines.
+- [x] **Android 5–7.1 (API 21–25)**: the ranchu board's goldfish screen, input and battery, legacy VirtIO MMIO (`vm/android`, `--android`).
+- [ ] **Android: goldfish pipe and qemud**, for the emulator's modem (apps' connectivity and DNS) and boot properties (the navigation bar).
+- [ ] **Android 8 and later**: vendor partitions, verified-boot (vbmeta) arguments, VirtIO PCI, gfxstream graphics.
 - [ ] **A NIC Windows drives inbox** (e1000e, or the like), for networking in Windows guests.
 - [x] **MSI-X for PCI devices**, through the in-kernel GIC's MSI frame (described in the MADT; there is no ITS).
 - [ ] **x86_64 Hypervisor Wiring**

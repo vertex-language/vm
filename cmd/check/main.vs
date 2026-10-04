@@ -2,6 +2,7 @@
 package main
 
 import (
+    "compress/gzip"
     "encoding/fdt"
     "fs"
     "fs/mmap"
@@ -473,6 +474,24 @@ func main() async -> int32 {
         check(false, "UnpackKernel failed on raw ARM64 Image")
     }
 
+    // A zboot image as Alpine's linux-virt is one: the header at the
+    // start of the file ("MZ", "zimg", payload offset and size, "gzip").
+    do {
+        let payload = gzip.Compress(synthArm64)
+        var z = [uint8](repeating: 0, count: 0x40)
+        z[0] = 0x4d; z[1] = 0x5a
+        z[4] = 0x7a; z[5] = 0x69; z[6] = 0x6d; z[7] = 0x67
+        z[8] = 0x40
+        z[12] = uint8(payload.count & 0xFF); z[13] = uint8(payload.count >> 8)
+        z[0x18] = 0x67; z[0x19] = 0x7a; z[0x1a] = 0x69; z[0x1b] = 0x70
+        z += payload
+        check(boot.DetectKernelFormat(z) == .efiZboot(compression: "gzip"), "DetectKernelFormat finds a zboot header at the file's start")
+        let unpacked = try await boot.UnpackKernel(z)
+        check(unpacked == synthArm64, "UnpackKernel unpacks a file-start zboot payload")
+    } catch {
+        check(false, "zboot at the file's start: \(error)")
+    }
+
     if let debianFile = try? fs.Open(fs.Path("testdata/debian/linux")) {
         defer { try? debianFile.Close() }
         var kHeader = [uint8](repeating: 0, count: 64)
@@ -627,6 +646,12 @@ func main() async -> int32 {
     await checkUsbStorage()
     await checkXhci()
     checkAcpiFixes()
+    checkAcpiTpm()
+    await checkTpm()
+    checkFirmware()
+
+    // 22. Android 5–7 on the emulator's devices.
+    checkAndroid()
 
     if failures == 0 {
         print("ALL VM CHECKS PASSED")

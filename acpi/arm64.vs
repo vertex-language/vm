@@ -25,6 +25,8 @@ public struct Arm64Config {
     public var MsiFrameBase: uint64 = 0
     public var MsiSpiBase: uint32 = 0
     public var MsiSpiCount: uint32 = 0
+    /// A TPM 2.0's TIS registers (5 localities, 0x5000 bytes); 0 for none.
+    public var TpmBase: uint64 = 0
     public var UartBase: uint64
     public var UartSize: uint64
     public var UartIrq: uint32
@@ -186,6 +188,19 @@ public func BuildArm64(_ cfg: Arm64Config) -> Payload {
     rtc.Name("_CRS", rtcRes.Template())
     sb.Device("RTC0", rtc)
 
+    // 1g. TPM 2.0 (MSFT0101), TIS over MMIO, polled.
+    if cfg.TpmBase != 0 {
+        var tpm = Aml()
+        tpm.Name("_HID", Aml.String("MSFT0101"))
+        tpm.Name("_STR", Aml.String("TPM 2.0 Device"))
+        tpm.Name("_UID", Aml.Integer(1))
+        tpm.Name("_STA", Aml.Integer(0xf))
+        var tpmRes = Resources()
+        tpmRes.Memory32(base: uint32(cfg.TpmBase), count: 0x5000)
+        tpm.Name("_CRS", tpmRes.Template())
+        sb.Device("TPM0", tpm)
+    }
+
     var topAml = Aml()
     topAml.Scope("\\_SB_", sb)
     let dsdtBytes = Dsdt(topAml)
@@ -248,8 +263,15 @@ public func BuildArm64(_ cfg: Arm64Config) -> Payload {
     tables.append(contentsOf: spcrBytes)
     align16(&tables)
 
-    // XSDT with 5 table entries: FADT, MADT, GTDT, MCFG, SPCR
-    let xsdtDummy = [uint64](repeating: 0, count: 5)
+    var targetOffsets: [int] = [fadtOffset, madtOffset, gtdtOffset, mcfgOffset, spcrOffset]
+    if cfg.TpmBase != 0 {
+        targetOffsets.append(tables.count)
+        tables.append(contentsOf: Tpm2Table())
+        align16(&tables)
+    }
+
+    // XSDT: an entry per table above.
+    let xsdtDummy = [uint64](repeating: 0, count: targetOffsets.count)
     let xsdtBytes = Xsdt(xsdtDummy)
     let xsdtOffset = tables.count
     tables.append(contentsOf: xsdtBytes)
@@ -268,7 +290,6 @@ public func BuildArm64(_ cfg: Arm64Config) -> Payload {
     loader.AddChecksum(file: "etc/acpi/tables", resultOffset: uint32(fadtOffset + 9), start: uint32(fadtOffset), length: uint32(fadtBytes.count))
 
     // 8c. Link XSDT entries -> FADT, MADT, GTDT, MCFG, SPCR
-    let targetOffsets: [int] = [fadtOffset, madtOffset, gtdtOffset, mcfgOffset, spcrOffset]
     for i in 0..<targetOffsets.count {
         let entryOffset = xsdtOffset + 36 + i * 8
         binary.LittleEndian.PutUint64(&tables, uint64(targetOffsets[i]), at: entryOffset)

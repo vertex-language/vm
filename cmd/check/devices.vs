@@ -394,3 +394,25 @@ func checkNvmeMsix() async {
           "NVMe MSI-X: an admin completion sends vector 0's message, synchronously")
     check(!lines.line(root.IntxLine(slot: slot)).Level, "NVMe MSI-X: INTx stays low while MSI-X is on")
 }
+
+func checkAcpiTpm() {
+    var cfg = acpi.Arm64Config(vcpus: 2, virtioCount: 0)
+    cfg.TpmBase = 0x0c00_0000
+    let t = acpi.BuildArm64(cfg).Tables
+    var found = -1
+    var i = 0
+    while i + 4 <= t.count {
+        if t[i] == 0x54 && t[i + 1] == 0x50 && t[i + 2] == 0x4d && t[i + 3] == 0x32 { found = i; break }
+        i += 16
+    }
+    check(found >= 0 && binary.LittleEndian.Uint32(t, from: found + 4) == 64 && t[found + 8] == 4
+          && binary.LittleEndian.Uint32(t, from: found + 48) == 6, "ACPI: TPM2 table, revision 4, TIS start method")
+    var dsdtHasTpm = false
+    let id = Array("MSFT0101".utf8)
+    var j = 0
+    while j + id.count <= t.count {
+        if Array(t[j..<j + id.count]) == id { dsdtHasTpm = true; break }
+        j += 1
+    }
+    check(dsdtHasTpm, "ACPI: the DSDT has the MSFT0101 TPM device")
+}

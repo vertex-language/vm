@@ -229,6 +229,13 @@ int32_t hvRun(int64_t handle, uint64_t* out) noexcept {
     case 0x01:     // WFI / WFE
         v->pending.advance = true;
         return ExitKind::halt;
+    case 0x00:
+        // An exception with no syndrome at all: seen when hv_vcpus_exit
+        // races the vCPU into a WFI (a VM stopping). Nothing to emulate;
+        // the caller runs it again, as after a cancel.
+        if (esr == 0) return ExitKind::canceled;
+        out[0] = esr;
+        return ExitKind::failed;
     default:
         out[0] = esr;
         return ExitKind::failed;
@@ -301,6 +308,15 @@ int32_t hvGicReg(int64_t handle, int32_t kind, uint32_t reg, uint64_t* out) noex
     return Code::invalid;
 }
 
+int32_t hvSetGicReg(int64_t handle, int32_t kind, uint32_t reg, uint64_t value) noexcept {
+    if (kind == 0) return fail(hv_gic_set_distributor_reg((hv_gic_distributor_reg_t)reg, value));
+    Vcpu* v = lookup(handle);
+    if (!v) return Code::invalid;
+    if (kind == 1) return fail(hv_gic_set_redistributor_reg(v->id, (hv_gic_redistributor_reg_t)reg, value));
+    if (kind == 2) return fail(hv_gic_set_icc_reg(v->id, (hv_gic_icc_reg_t)reg, value));
+    return Code::invalid;
+}
+
 int32_t hvKick(int64_t handle) noexcept {
     Vcpu* v = lookup(handle);
     if (!v) return Code::invalid;
@@ -334,6 +350,7 @@ int32_t hvSetReg(int64_t, int32_t, uint64_t) noexcept { return Code::unsupported
 int32_t hvSetSegment(int64_t, int32_t, uint64_t, uint32_t, uint16_t, uint16_t) noexcept { return Code::unsupported; }
 int32_t hvUnmaskTimer(int64_t) noexcept { return Code::unsupported; }
 int32_t hvGicReg(int64_t, int32_t, uint32_t, uint64_t*) noexcept { return Code::unsupported; }
+int32_t hvSetGicReg(int64_t, int32_t, uint32_t, uint64_t) noexcept { return Code::unsupported; }
 int32_t hvKick(int64_t) noexcept { return Code::unsupported; }
 void hvCloseVcpu(int64_t) noexcept {}
 int32_t lastError() noexcept { return 0; }

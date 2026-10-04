@@ -51,3 +51,41 @@ public func LinuxArm64(kernel: [uint8], initrd: [uint8]?, cmdline: string, ram: 
     p.Entry = .arm64(pc: kernelAt, x0: dtbAt)
     return p
 }
+
+/// The version an uncompressed Linux kernel announces ("Linux version
+/// 3.18.91+ (…)"), as (major, minor), or nil where it says none.
+public func LinuxVersion(_ kernel: [uint8]) -> (int, int)? {
+    let key = [uint8]("Linux version ".utf8)
+    var i = 0
+    let limit = kernel.count - key.count - 8
+    while i < limit {
+        if kernel[i] == key[0] {
+            var match = true
+            for k in 1..<key.count where kernel[i + k] != key[k] {
+                match = false
+                break
+            }
+            if match {
+                var j = i + key.count
+                var nums: [int] = [0, 0]
+                for part in 0..<2 {
+                    var digits = 0
+                    while j < kernel.count && kernel[j] >= 0x30 && kernel[j] <= 0x39 && digits < 4 {
+                        nums[part] = nums[part] * 10 + int(kernel[j] - 0x30)
+                        j += 1
+                        digits += 1
+                    }
+                    if digits == 0 { break }
+                    if part == 0 {
+                        if j >= kernel.count || kernel[j] != 0x2e { break }
+                        j += 1
+                    } else {
+                        return (nums[0], nums[1])
+                    }
+                }
+            }
+        }
+        i += 1
+    }
+    return nil
+}

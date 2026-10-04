@@ -39,6 +39,7 @@ public final class Framebuffer {
     let memory: device.GuestMemory
     let lock = sync.Mutex()
     var generation: uint64 = 0
+    var frames: uint64 = 0
 
     public private(set) var HostPointer: UnsafeMutableRawPointer? = nil
 
@@ -56,72 +57,81 @@ public final class Framebuffer {
             Stride = stride
             Format = format
             generation += 1
+            frames += 1
         }
     }
+
+    /// The guest showed a new frame without changing the mode (a page
+    /// flip to the same buffer).
+    public func Post() {
+        lock.withLock { frames += 1 }
+    }
+
+    /// Bumped for every frame the guest shows, where its device says
+    /// (goldfish-fb's SET_BASE): a viewer redraws only when it moves.
+    /// Stays 0 for screens the guest draws into in place.
+    public var Frames: uint64 { lock.withLock { frames } }
 
     public var Configured: bool { lock.withLock { Width > 0 && Height > 0 } }
 
     /// Bumped each time the mode changes, so a viewer knows to resize.
     public var Generation: uint64 { lock.withLock { generation } }
 
+    /// The RGBA buffer Snapshot fills, kept between calls.
+    var scratch: [uint8] = []
+
     /// Copies the visible pixels out as tightly packed RGBA rows, for
-    /// ui/window's Present.
+    /// ui/window's Present. Reads guest RAM in place through a host
+    /// pointer: a viewer calls this every frame, on the thread device
+    /// tasks share, so it must stay cheap.
     public func Snapshot() throws -> [uint8] {
         let (addr, w, h, stride, fmt, hostPtr) = lock.withLock {
             (Address, Width, Height, Stride, Format, HostPointer)
         }
         if w <= 0 || h <= 0 { return [] }
-        var out = [uint8](repeating: 0, count: w * h * 4)
-
-        if let ptr = hostPtr {
-            let p = UnsafePointer<uint8>(ptr)
+        let src = try hostPtr ?? memory.Pointer(addr, count: uint64(stride * h))
+        let p = UnsafePointer<uint8>(src.assumingMemoryBound(to: uint8.self))
+        if scratch.count != w * h * 4 { scratch = [uint8](repeating: 255, count: w * h * 4) }
+        scratch.withUnsafeMutableBufferPointer { out in
             for y in 0..<h {
-                let rowOffset = y * stride
-                let dstRow = y * w * 4
-                if fmt == .xrgb8888 {
-                    var x = 0
-                    while x < w {
-                        let srcIdx = rowOffset + x * 4
-                        let dstIdx = dstRow + x * 4
-                        out[dstIdx] = p[srcIdx + 2]     // R
-                        out[dstIdx + 1] = p[srcIdx + 1] // G
-                        out[dstIdx + 2] = p[srcIdx]     // B
-                        out[dstIdx + 3] = 255           // A
-                        x += 1
+                let row = p + y * stride
+                var d = y * w * 4
+                switch fmt {
+                case .rgb565:
+                    // RRRRRGGG GGGBBBBB, little-endian; widen each to 8 bits.
+                    for x in 0..<w {
+                        let v = uint32(row[x * 2]) | (uint32(row[x * 2 + 1]) << 8)
+                        let r = (v >> 11) & 0x1f
+                        let g = (v >> 5) & 0x3f
+                        let b = v & 0x1f
+                        out[d] = uint8((r << 3) | (r >> 2))
+                        out[d + 1] = uint8((g << 2) | (g >> 4))
+                        out[d + 2] = uint8((b << 3) | (b >> 2))
+                        out[d + 3] = 255
+                        d += 4
                     }
-                } else {
-                    for x in 0..<(w * 4) {
-                        out[dstRow + x] = p[rowOffset + x]
+                case .xrgb8888:
+                    for x in 0..<w {
+                        out[d] = row[x * 4 + 2]
+                        out[d + 1] = row[x * 4 + 1]
+                        out[d + 2] = row[x * 4]
+                        out[d + 3] = 255
+                        d += 4
+                    }
+                case .xbgr8888:
+                    for x in 0..<w {
+                        out[d] = row[x * 4]
+                        out[d + 1] = row[x * 4 + 1]
+                        out[d + 2] = row[x * 4 + 2]
+                        out[d + 3] = 255
+                        d += 4
                     }
                 }
             }
-            return out
         }
-
-        for y in 0..<h {
-            let row = try memory.Read(addr.Adding(uint64(y * stride)), count: w * 4)
-            let dstRow = y * w * 4
-            if fmt == .xrgb8888 {
-                var x = 0
-                while x < w {
-                    let srcIdx = x * 4
-                    let dstIdx = dstRow + srcIdx
-                    out[dstIdx] = row[srcIdx + 2]
-                    out[dstIdx + 1] = row[srcIdx + 1]
-                    out[dstIdx + 2] = row[srcIdx]
-                    out[dstIdx + 3] = 255
-                    x += 1
-                }
-            } else {
-                for i in 0..<row.count {
-                    out[dstRow + i] = row[i]
-                }
-            }
-        }
-        return out
+        return scratch
     }
 
-    /// Converts the current framebuffer snapshot into a standard image.RGBA.
     public func ToImage() throws -> image.RGBA? {
         let (w, h) = lock.withLock { (Width, Height) }
         if w <= 0 || h <= 0 { return nil }

@@ -19,6 +19,12 @@ public final class VcpuWorker {
     public var EntryPc: uint64
     public var EntryX0: uint64
     public var EntryPstate: uint64 = 0x3c5
+    /// Puts every interrupt in Group 1 (non-secure) before the guest runs,
+    /// as firmware would: for a kernel booted directly. Linux before 4.x
+    /// leaves the groups as it finds them, and the GIC resets them to
+    /// Group 0, which it signals as FIQs the kernel never takes. QEMU does
+    /// the same for direct boots.
+    public var GroupOneAtReset = false
 
     var vcpu: hypervisor.Vcpu? = nil
     var thread: sync.Thread? = nil
@@ -123,6 +129,7 @@ public final class VcpuWorker {
             return "?"
         }
         s += "\n  GICD ISPENDR1=\(gic(0, 0x204)) ISACTIVER1=\(gic(0, 0x304)) ISENABLER1=\(gic(0, 0x104))"
+        s += "\n  GICD CTLR=\(gic(0, 0x0)) IGROUPR1=\(gic(0, 0x84)) GICR IGROUPR0=\(gic(1, 0x10080)) IPRIORITYR27=\(gic(1, 0x10418)) ICC IGRPEN1=\(gic(2, 0xc667)) IGRPEN0=\(gic(2, 0xc666))"
         s += "\n  GICR ISPENDR0=\(gic(1, 0x10200)) ISACTIVER0=\(gic(1, 0x10300)) ISENABLER0=\(gic(1, 0x10100)) ICC PMR=\(gic(2, 0xc230)) RPR=\(gic(2, 0xc65b)) AP1R0=\(gic(2, 0xc648))"
         s += "\n  exits mmio=\(ExitCounts[0]) hvc=\(ExitCounts[1]) sysreg=\(ExitCounts[2]) wfi=\(ExitCounts[3]) vtimer=\(ExitCounts[4]) kick=\(ExitCounts[5]) other=\(ExitCounts[6])"
         return s
@@ -150,6 +157,14 @@ public final class VcpuWorker {
         } catch {
             lock.withLock { stopped = true; running = false }
             return
+        }
+        if GroupOneAtReset {
+            // GICR_IGROUPR0: this CPU's SGIs and PPIs.
+            try? v.SetGicReg(kind: 1, 0x1_0080, 0xffff_ffff)
+            if isBootCpu {
+                // GICD_IGROUPR1..31: the SPIs (writes past the last are ignored).
+                for i in 1..<32 { try? v.SetGicReg(kind: 0, uint32(0x80 + 4 * i), 0xffff_ffff) }
+            }
         }
 
         while true {

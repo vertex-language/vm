@@ -3,6 +3,7 @@
 package qcow2
 
 import (
+    "compress/flate"
     "encoding/binary"
     "fs"
     "vm/disk"
@@ -42,6 +43,9 @@ public final class Image: disk.Image {
     /// backing image.
     enum Location {
         case host(uint64)
+        /// A deflated cluster: where it starts, how many bytes it takes,
+        /// and where in the inflated cluster the wanted byte is.
+        case compressed(start: uint64, size: uint64, within: uint64)
         case zero
         case backing
     }
@@ -59,7 +63,13 @@ public final class Image: disk.Image {
         }
         let entry = try l2Table(at: l2Offset)[int(l2Index)]
         if entry & compressedFlag != 0 {
-            throw disk.DiskError.unsupported("compressed clusters")
+            // The low 62 - (clusterBits - 8) bits are the byte offset, the
+            // next clusterBits - 8 the count of further 512-byte sectors.
+            let sectorBits = uint64(Header.ClusterBits) - 8
+            let offsetBits = 62 - sectorBits
+            let start = entry & ((1 << offsetBits) - 1)
+            let sectors = ((entry >> offsetBits) & ((1 << sectorBits) - 1)) + 1
+            return .compressed(start: start, size: sectors * 512 - (start & 511), within: offset % cs)
         }
         if Header.Version == 3 && entry & zeroFlag != 0 {
             return .zero
@@ -88,6 +98,58 @@ public final class Image: disk.Image {
         return t
     }
 
+    /// One deflated cluster, whole: raw DEFLATE, padded with zeros if the
+    /// image's writer left the tail unsaid.
+    func inflateCluster(start: uint64, size: uint64) throws -> [uint8] {
+        var raw = [uint8](repeating: 0, count: int(size))
+        let got = try file.Read(into: &raw, at: int64(start))
+        var out = try flate.Decompress(got == raw.count ? raw : Array(raw[0..<got]))
+        let cs = int(Header.ClusterSize)
+        if out.count < cs {
+            out.append(contentsOf: [uint8](repeating: 0, count: cs - out.count))
+        }
+        return out
+    }
+
+    /// Whether anything is stored for the cluster holding `offset`: data
+    /// of its own, a deflated cluster, or (with a backing image) whatever
+    /// the backing holds. A cluster that is not reads as zeros, so a copy
+    /// can skip it without reading.
+    public func IsAllocated(_ offset: uint64) throws -> bool {
+        switch try locate(offset) {
+        case .zero: return false
+        default: return true
+        }
+    }
+
+    /// ReadAt without `async`, for an image with no backing file: a copy
+    /// loop that needn't suspend can be an ordinary function.
+    public func ReadSync(_ offset: uint64, into buffer: inout [uint8]) throws {
+        try disk.CheckRange(self, offset, uint64(buffer.count))
+        let cs = Header.ClusterSize
+        var done: uint64 = 0
+        let total = uint64(buffer.count)
+        while done < total {
+            let at = offset + done
+            let n = int(min(cs - at % cs, total - done))
+            let from = int(done)
+            switch try locate(at) {
+            case .host(let h):
+                var chunk = [uint8](repeating: 0, count: n)
+                _ = try file.Read(into: &chunk, at: int64(h))
+                for i in 0..<n { buffer[from + i] = chunk[i] }
+            case .compressed(let start, let size, let within):
+                let inflated = try inflateCluster(start: start, size: size)
+                for i in 0..<n { buffer[from + i] = inflated[int(within) + i] }
+            case .backing:
+                throw disk.DiskError.unsupported("ReadSync on an image with a backing file")
+            case .zero:
+                for i in 0..<n { buffer[from + i] = 0 }
+            }
+            done += uint64(n)
+        }
+    }
+
     public func ReadAt(_ offset: uint64, into buffer: inout [uint8]) async throws {
         try disk.CheckRange(self, offset, uint64(buffer.count))
         let cs = Header.ClusterSize
@@ -95,20 +157,24 @@ public final class Image: disk.Image {
         let total = uint64(buffer.count)
         while done < total {
             let at = offset + done
-            let n = min(cs - at % cs, total - done)
-            var chunk = [uint8](repeating: 0, count: int(n))
+            let n = int(min(cs - at % cs, total - done))
+            let from = int(done)
             switch try locate(at) {
             case .host(let h):
+                var chunk = [uint8](repeating: 0, count: n)
                 _ = try file.Read(into: &chunk, at: int64(h))
+                for i in 0..<n { buffer[from + i] = chunk[i] }
+            case .compressed(let start, let size, let within):
+                let inflated = try inflateCluster(start: start, size: size)
+                for i in 0..<n { buffer[from + i] = inflated[int(within) + i] }
             case .backing:
+                var chunk = [uint8](repeating: 0, count: n)
                 try await Backing!.ReadAt(at, into: &chunk)
+                for i in 0..<n { buffer[from + i] = chunk[i] }
             case .zero:
-                break
+                for i in 0..<n { buffer[from + i] = 0 }
             }
-            for i in 0..<int(n) {
-                buffer[int(done) + i] = chunk[i]
-            }
-            done += n
+            done += uint64(n)
         }
     }
 

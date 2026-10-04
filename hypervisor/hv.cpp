@@ -163,6 +163,10 @@ export int32_t hvUnmaskTimer(int64_t v) noexcept;
 // vCPU's thread.
 export int32_t hvGicReg(int64_t v, int32_t kind, uint32_t reg, uint64_t* out) noexcept;
 
+// Writes one, as hvGicReg names them: to set up what firmware would have
+// (interrupt groups) before a kernel booted directly runs.
+export int32_t hvSetGicReg(int64_t v, int32_t kind, uint32_t reg, uint64_t value) noexcept;
+
 // From any thread: makes the vCPU's hvRun return ExitKind::canceled soon.
 export int32_t hvKick(int64_t v) noexcept;
 

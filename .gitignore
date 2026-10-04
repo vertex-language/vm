@@ -16,6 +16,15 @@
 # Local downloaded test media
 testdata/debian/
 testdata/ubuntu/
+testdata/android/
 
 # boot-test screenshots
 uefi_*.png
+
+# TPM state boot-test makes
+testdata/*.tpm/
+
+# EFI variable stores and owners vm-run keeps beside disks
+*.efivars
+*.efivars.firmware
+*.tpm/

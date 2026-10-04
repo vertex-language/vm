@@ -200,6 +200,12 @@ public final class Vcpu {
         return value
     }
 
+    /// Writes an in-kernel interrupt controller register, named as GicReg
+    /// names them. Call on the vCPU's thread.
+    public func SetGicReg(kind: int32, _ reg: uint32, _ value: uint64) throws {
+        try check(hvSetGicReg(handle, kind, reg, value), "writing interrupt controller register 0x\(string(reg, radix: 16))")
+    }
+
     /// Makes `Run` return `.canceled` soon. Safe from any thread.
     public func Kick() {
         _ = hvKick(handle)

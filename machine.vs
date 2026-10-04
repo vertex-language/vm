@@ -44,6 +44,8 @@ public final class Machine: PsciController {
     public var ConsoleUart: chipset.Pl011? { Wired.ConsoleUart }
     public var KeyboardInput: virtio.Input? { Wired.KeyboardInput }
     public var TabletInput: virtio.Input? { Wired.TabletInput }
+    /// Android guests' touchscreen and keys.
+    public var GoldfishEvents: chipset.GoldfishEvents? { Wired.GoldfishEvents }
     /// A Windows guest's USB keyboard and tablet.
     public var UsbKeyboard: usb.Keyboard? { Wired.UsbKeyboard }
     public var UsbTablet: usb.Tablet? { Wired.UsbTablet }
@@ -123,7 +125,9 @@ public final class Machine: PsciController {
 
         // 4b. Framebuffer setup (if enabled)
         var fbConfig: FramebufferConfig? = nil
-        if cfg.Display.Enabled {
+        if let gf = wired.GoldfishFb {
+            machine.Framebuffer = gf.Framebuffer
+        } else if cfg.Display.Enabled {
             let width = cfg.Display.Width
             let height = cfg.Display.Height
             let cfgFb = FramebufferConfig(
@@ -178,7 +182,10 @@ public final class Machine: PsciController {
                     initrd: plan.Initrd,
                     cmdline: plan.Cmdline,
                     virtioCount: wired.VirtioCount,
-                    framebuffer: fbConfig
+                    framebuffer: fbConfig,
+                    goldfishFb: wired.GoldfishFb != nil,
+                    goldfishEvents: wired.GoldfishEvents != nil,
+                    goldfishBattery: wired.GoldfishBattery != nil
                 )
                 if let dtbAddr = plan.DeviceTree {
                     try ram.Memory.Write(dtbAddr, dtb)
@@ -220,6 +227,9 @@ public final class Machine: PsciController {
                     acpiCfg.MsiFrameBase = PlatformArm64.GicMsiBase
                     acpiCfg.MsiSpiBase = PlatformArm64.GicMsiSpiBase
                     acpiCfg.MsiSpiCount = PlatformArm64.GicMsiSpiCount
+                    if wired.Tpm != nil {
+                        acpiCfg.TpmBase = PlatformArm64.TpmBase
+                    }
                     let payload = acpi.BuildArm64(acpiCfg)
                     fwcfg.Add(boot.FwCfg.File(name: "etc/acpi/tables", bytes: payload.Tables))
                     fwcfg.Add(boot.FwCfg.File(name: "etc/acpi/rsdp", bytes: payload.Rsdp))
@@ -236,7 +246,8 @@ public final class Machine: PsciController {
                     framebuffer: fbConfig,
                     enableFwCfg: wired.FwCfg != nil,
                     enableFlash: true,
-                    enablePci: wired.PciRoot != nil
+                    enablePci: wired.PciRoot != nil,
+                    enableTpm: wired.Tpm != nil
                 )
 
                 // 5. Place DTB at start of RAM (0x4000_0000)
@@ -262,6 +273,7 @@ public final class Machine: PsciController {
                 entryPc: isBoot ? bootPc : 0,
                 entryX0: isBoot ? bootX0 : 0
             )
+            worker.GroupOneAtReset = cfg.Boot != nil && !isEfiBoot(cfg.Boot)
             machine.vcpus.append(worker)
         }
 
@@ -317,6 +329,7 @@ public final class Machine: PsciController {
             v.Join()
         }
         Partition.Close()
+        Wired.Tpm?.Shutdown()
         flash0 = nil
         Pflash = nil
         fbMapping = nil
