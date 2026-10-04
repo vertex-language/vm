@@ -9,7 +9,8 @@ import "vm/android"
 ## Types
 
 - **`AndroidError`** (enum): Not a bundle, or a release vm can't boot yet.
-- **`Bundle`** (struct): An unpacked emulator image: its directory, API level and release, `Kernel` (`kernel-ranchu`), `Ramdisk`, the `Disks` in the order its `fstab.ranchu` names them (system, cache, userdata), and `Cmdline()`, the kernel command line the emulator gives it.
+- **`BootProperties`** (struct): What the emulator's qemud boot-properties service would set (Java heap, screen density, navigation bar); `ForScreen(width:)` picks them for a screen size.
+- **`Bundle`** (struct): An unpacked emulator image: its directory, API level and release, `Kernel` (`kernel-ranchu`), `Ramdisk`, the `Disks` in the order its `fstab.ranchu` names them (system, cache, userdata), `Cmdline()`, the kernel command line the emulator gives it, and `BootRamdisk(_:)`, the ramdisk with `BootProperties` added to its `default.prop` (a second cpio archive after the image's own).
 
 ## Use
 

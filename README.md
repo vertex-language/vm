@@ -85,7 +85,7 @@ Comprehensive disk and ISO management utility:
 - `convert <source> <dest>`: Converts/copies disk images to raw disk images.
 
 ### 3. `check` (`cmd/check`)
-Offline test suite with 182 passing verification checks covering all device models (VirtIO, PCI, NVMe, xHCI, USB storage), FDT and ACPI generation, network packet parsers, ISO 9660 directory structures, and kernel decompressors without requiring hypervisor permissions.
+Offline test suite with 185 passing verification checks covering all device models (VirtIO, PCI, NVMe, xHCI, USB storage), FDT and ACPI generation, network packet parsers, ISO 9660 directory structures, and kernel decompressors without requiring hypervisor permissions.
 
 ### 4. `boot-test` (`cmd/boot-test`)
 Live hypervisor integration test suite executing bare-metal machine cycles, direct kernel boots and a UEFI boot of a Windows ARM64 ISO against Apple's `Hypervisor.framework`. `./boot-test pmu` checks that PMU registers work under the in-kernel GIC; `./boot-test trace-late` traces xHCI and SCSI traffic once Windows has taken over.
@@ -99,7 +99,7 @@ Live hypervisor integration test suite executing bare-metal machine cycles, dire
 On macOS, binaries using `Hypervisor.framework` require the `com.apple.security.hypervisor` entitlement:
 
 ```bash
-# 1. Run offline verification suite (182 checks)
+# 1. Run offline verification suite (185 checks)
 vsc run ./cmd/check
 
 # 2. Build and sign the VM runner
@@ -184,13 +184,20 @@ vm presents the emulator's "ranchu" board, the devices its goldfish kernels
 | console | PL011 `ttyAMA0` | a shell (`shell@generic_arm64`); `su` for root |
 | interrupts | GICv3, every interrupt put in Group 1 before a direct boot | as firmware (or QEMU) would: Linux 3.18 leaves them in Group 0, which the GIC signals as FIQs it never takes |
 
+The emulator hands Android some properties at boot through its qemud
+"boot-properties" service; vm has no qemud yet, so it adds them to the
+ramdisk's `default.prop` instead (a second cpio archive after the image's,
+built in memory; the image is untouched): `dalvik.vm.heapsize` (256 MB; the
+runtime's 16 MB default runs the launcher out of memory opening its app
+drawer), `ro.sf.lcd_density` (320 for 720 wide) and `qemu.hw.mainkeys=0`
+(the Back / Home / Recents bar).
+
 It boots to the launcher in about a minute (software rendering:
 `qemu.gles=0`), SELinux permissive. Not yet: DNS and connectivity for apps
 (Android 5 gets its default network from the emulator's modem, RIL over a
-goldfish pipe; IP works, `su 0 ping 1.1.1.1`), the navigation bar (the
-emulator turns it on through its qemud boot properties), sound, and Android
-8 and later (a vendor partition, verified-boot metadata, and goldfish pipes
-for graphics).
+goldfish pipe; IP works, `su 0 ping 1.1.1.1`), sound, and Android 8 and
+later (a vendor partition, verified-boot metadata, and goldfish pipes for
+graphics).
 
 ### Inspecting and Extracting ISO Images
 
@@ -267,7 +274,7 @@ The core microVM engine, direct Linux boot, ISO auto-boot, user-space networking
 - [x] **Secure Boot**: Secure Boot firmware with Microsoft's keys enrolled (`firmware/`).
 - [x] **Container images as VMs**: moved to [`container`](../container) (`container run`, `container build`), which owns images-as-containers; `vm` only boots machines.
 - [x] **Android 5–7.1 (API 21–25)**: the ranchu board's goldfish screen, input and battery, legacy VirtIO MMIO (`vm/android`, `--android`).
-- [ ] **Android: goldfish pipe and qemud**, for the emulator's modem (apps' connectivity and DNS) and boot properties (the navigation bar).
+- [ ] **Android: goldfish pipe and qemud**, for the emulator's modem (apps' connectivity and DNS), sensors, and boot properties from the host (today they ride in the ramdisk).
 - [ ] **Android 8 and later**: vendor partitions, verified-boot (vbmeta) arguments, VirtIO PCI, gfxstream graphics.
 - [ ] **A NIC Windows drives inbox** (e1000e, or the like), for networking in Windows guests.
 - [x] **MSI-X for PCI devices**, through the in-kernel GIC's MSI frame (described in the MADT; there is no ITS).

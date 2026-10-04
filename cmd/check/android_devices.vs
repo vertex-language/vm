@@ -1,4 +1,9 @@
 import (
+    "archive/cpio"
+    "compress/gzip"
+    "fs"
+    "io"
+    "vm/android"
     "vm/boot"
     "vm/chipset"
     "vm/device"
@@ -83,4 +88,41 @@ func checkAndroid() {
     check(bat.Read(offset: 0x14, size: 4) == 1 && bat.Read(offset: 0x18, size: 4) == 100 && bat.Read(offset: 0x08, size: 4) == 1,
           "goldfish-battery: present, 100%, AC online")
     _ = mem.1
+    checkAndroidRamdisk()
+}
+
+/// The emulator's boot properties ride in a second cpio archive after the
+/// image's ramdisk, whose default.prop is the image's plus them.
+func checkAndroidRamdisk() {
+    do {
+        let dir = try fs.TempDir(prefix: "vm-android-")
+        defer { try? fs.RemoveAll(dir) }
+        var w = cpio.Writer(io.Cursor())
+        let prop = [uint8]("ro.secure=0\n".utf8)
+        try w.WriteHeader(cpio.Header(name: "default.prop", mode: cpio.ModeType.regular | 0o644, size: int64(prop.count)))
+        try w.Write(prop)
+        try w.Close()
+        let original = gzip.Compress(w.Inner.Bytes)
+        try fs.WriteFile(dir / "ramdisk.img", original)
+        for f in ["kernel-ranchu", "system.img", "cache.img", "userdata.img"] { try fs.WriteFile(dir / f, [0]) }
+        try fs.WriteFile(dir / "source.properties", [uint8]("AndroidVersion.ApiLevel=21\n".utf8))
+        let b = try android.Bundle.Open(dir.Value)
+        check(b.ApiLevel == 21 && b.Disks.count == 3, "Android bundle: API 21, system/cache/userdata")
+        let rd = try b.BootRamdisk(android.BootProperties.ForScreen(width: 720))
+        check(Array(rd[0..<original.count]) == original && rd.count > original.count,
+              "Android ramdisk: the image's archive first, untouched")
+        var start = original.count
+        while start % 4 != 0 { start += 1 }
+        var r = cpio.Reader(io.Cursor(Array(rd[start...])))
+        if let h = try r.Next(), h.Name == "default.prop" {
+            let text = string(decoding: try r.ReadAll(), as: UTF8.self)
+            check(text.hasPrefix("ro.secure=0\n") && text.contains("dalvik.vm.heapsize=256m") &&
+                  text.contains("ro.sf.lcd_density=320") && text.contains("qemu.hw.mainkeys=0"),
+                  "Android ramdisk: default.prop is the image's plus heap, density and navigation bar")
+        } else {
+            check(false, "Android ramdisk: a default.prop follows")
+        }
+    } catch {
+        check(false, "Android ramdisk threw \(error)")
+    }
 }

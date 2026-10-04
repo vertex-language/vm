@@ -416,6 +416,9 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
                 displayWidth = 720
                 displayHeight = 1280
             }
+            // The emulator's boot properties (heap, density, navigation
+            // bar), added to the ramdisk's default.prop.
+            initrdBytes = try b.BootRamdisk(android.BootProperties.ForScreen(width: displayWidth))
             print("[Android] \(b.Release.isEmpty ? "API \(b.ApiLevel)" : "Android \(b.Release) (API \(b.ApiLevel))") from \(b.Dir)")
         } catch {
             print("Error: \(error)")
