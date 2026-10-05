@@ -11,7 +11,6 @@ import (
     "fs"
     "io"
     "vm"
-    "vm/disk"
 )
 
 public enum AndroidError: Error, CustomStringConvertible {
@@ -93,17 +92,6 @@ public struct Bundle {
                       SystemAsRoot: api >= 28)
     }
 
-    /// The disks, opened, whole: a GPT disk keeps its partition table, so
-    /// the guest's kernel names the partition (PARTNAME), which Android
-    /// 8's first stage looks for.
-    public func OpenDisks() async throws -> [any disk.Image] {
-        var out: [any disk.Image] = []
-        for d in Disks {
-            out.append(try await vm.OpenDisk(fs.Path(d.Path)))
-        }
-        return out
-    }
-
     /// The kernel command line the emulator would give this image: the
     /// console on the PL011, the ranchu board's init scripts, software
     /// rendering (no host GL behind a pipe), SELinux permissive (eng
@@ -152,13 +140,18 @@ func earlyMounts(_ fstab: string, _ disks: [Disk]) -> [vm.AndroidMount] {
         if dev.hasPrefix("/dev/block/vd") && dev.count == 14, let c = dev.utf8.last, c >= 0x61, c <= 0x7a {
             let slot = int(c - 0x61)
             if slot < disks.count, let part = disks[slot].Partition {
-                let addr = vm.PlatformArm64.VirtioMmioBase + uint64(slot) * vm.PlatformArm64.VirtioMmioStride
-                dev = "/dev/block/platform/\(string(addr, radix: 16)).virtio_mmio/by-name/\(part)"
+                dev = byName(slot: slot, partition: part)
             }
         }
         out.append(vm.AndroidMount(name: string(f[1].dropFirst()), device: dev, fsType: f[2], mountFlags: f[3], fsmgrFlags: f[4]))
     }
     return out
+}
+
+/// The by-name link init makes for `partition` of the disk in virtio-mmio `slot`.
+func byName(slot: int, partition: string) -> string {
+    let addr = vm.PlatformArm64.VirtioMmioBase + uint64(slot) * vm.PlatformArm64.VirtioMmioStride
+    return "/dev/block/platform/\(string(addr, radix: 16)).virtio_mmio/by-name/\(partition)"
 }
 
 /// `key=value` lines.

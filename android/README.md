@@ -9,10 +9,10 @@ import "vm/android"
 ## Types
 
 - **`AndroidError`** (enum): Not a bundle, or a release vm can't boot yet.
-- **`BootProperties`** (struct): What the emulator tells Android at boot (Java heap, screen density, navigation bar): `RamdiskLines`, read at startup, go in the ramdisk; `ServiceLines` through qemud. `Ethernet`: eth0 as the device's network, through Android's EthernetService. `HostGpu`: draw through the host renderer. `ForScreen(width:)` picks them for a screen size.
+- **`BootProperties`** (struct): What the emulator tells Android at boot (Java heap, screen density, navigation bar): `RamdiskLines`, read at startup, go in the ramdisk; `ServiceLines` through qemud. `Ethernet`: eth0 as the device's network, through Android's EthernetService (Android 5–8: the feature file in the ramdisk; Android 9: on an /oem partition, below). `HostGpu`: draw through the host renderer. `ForScreen(width:)` picks them for a screen size.
 - **`BootPropertiesService`** (class): qemud's `boot-properties` service, on the goldfish pipe.
 - **`LogcatService`** (class): the emulator's `logcat` pipe service: the device's log as lines of text.
-- **`Bundle`** (struct): An unpacked emulator image: its directory, API level and release, `Kernel` (`kernel-ranchu`), `Ramdisk`, the `Disks` in the order its `fstab.ranchu` names them (system, cache, userdata), `Cmdline()`, the kernel command line the emulator gives it, and `BootRamdisk(_:)`, the ramdisk with `BootProperties` added to its `default.prop` (a second cpio archive after the image's own).
+- **`Bundle`** (struct): An unpacked emulator image: its directory, API level and release, `Kernel` (`kernel-ranchu`), `Ramdisk`, the `Disks` in the order its `fstab.ranchu` names them (system, cache, userdata), `Cmdline()`, the kernel command line the emulator gives it, and `BootRamdisk(_:)`, the ramdisk with `BootProperties` added to its `default.prop` (a second cpio archive after the image's own). `OpenDisks(_:)` opens the disks, and `FirstStageMounts(_:)` is what init's first stage mounts from the device tree. Android 9 has no ramdisk, so with `Ethernet` its vendor disk is presented as a GPT disk of two partitions (`disk.GptDisk`): `vendor`, read from vendor.img, and `oem`, an ext4 made in memory (`fs/ext4`) holding `OemFiles`, mounted at /oem. A disk of its own would be vdf, which the vendor's fstab gives vold as the SD card.
 
 ## Use
 

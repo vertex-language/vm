@@ -503,12 +503,12 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
         // The image's disks in its fstabs' order (GPT partitions opened
         // as disks), then any --disk given; and its first-stage mounts.
         do {
-            for img in try await b.OpenDisks() { cfg.Storage.append(.disk(img)) }
+            for img in try await b.OpenDisks(bootProps) { cfg.Storage.append(.disk(img)) }
         } catch {
             print("Error: opening the image's disks: \(error)")
             return
         }
-        cfg.AndroidMounts = b.EarlyMounts
+        cfg.AndroidMounts = b.FirstStageMounts(bootProps)
         cfg.Guest = .android
         // Android can't run without a screen (SurfaceFlinger aborts), so
         // it always has one; --display only decides whether a window shows it.

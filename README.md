@@ -231,11 +231,17 @@ partition (`root=/dev/vda1 skip_initramfs`) and runs its init; there is no
 ramdisk, so the emulator's settings (`qemu.dalvik.vm.heapsize`,
 `qemu.opengles.version`) go on the kernel command line, which init reads as
 `ro.kernel.qemu.*`. The disks follow the vendor's fstab: system, cache,
-userdata, encryptionkey, vendor. On first boot vold encrypts userdata in
+userdata, encryptionkey, vendor. Its network is Ethernet, as on Android 5–8:
+with no ramdisk to carry the feature file, the vendor disk is presented as a
+GPT disk of two partitions, `vendor` (vendor.img's) and `oem` (a small ext4
+made in memory, [`fs/ext4`](../fs)), and init's first stage mounts `/oem`
+from the device tree. EthernetService takes eth0 and its DHCP lease, and the
+network validates; the image's own `dhcpclient` and virtual Wi-Fi are left
+as they are. On first boot vold encrypts userdata in
 place, as on the emulator, which is why `vmimage --clone` formats it as
 ext4 first ([`fs/ext4`](../fs)). The 4.4 kernel names its goldfish devices
-`google,…`; the device tree lists both names. Not yet: its network (the
-emulator's virtual Wi-Fi), the `refcount` and `GLProcessPipe` pipes.
+`google,…`; the device tree lists both names. Not yet: the `refcount` and
+`GLProcessPipe` pipes.
 Android 10 and later are refused (super partition, vbmeta).
 
 ```bash

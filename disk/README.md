@@ -4,7 +4,7 @@ What disk devices read and write.
 
 | Package | What it is |
 | :--- | :--- |
-| **`vm/disk`** | the `Image` protocol; `Raw` files (and ISOs, read-only); `MemoryImage` for tests; ISO 9660 PVD/directory parser, file extraction, and distribution boot file detection (`disk/iso.vs`) |
+| **`vm/disk`** | the `Image` protocol; `Raw` files (and ISOs, read-only); `MemoryImage` for tests and scratch disks; GPT: `Partitions` reads a disk's table, `Slice` presents one partition as a disk, and `GptDisk` puts a GPT disk together from other images, its tables made in memory; ISO 9660 PVD/directory parser, file extraction, and distribution boot file detection (`disk/iso.vs`) |
 | **`vm/disk/qcow2`** | QCOW2 v2/v3: L1/L2 tables, refcounts, copy-on-write, backing files |
 | **`vm/disk/vhdx`** | VHDX: Hyper-V's format, the one Windows images come in |
 

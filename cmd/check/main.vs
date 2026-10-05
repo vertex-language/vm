@@ -544,6 +544,7 @@ func main() async -> int32 {
     checkGoldfishPipe()
     checkGfxstream()
     await checkQcow2Write()
+    await checkGptDisk()
 
     if failures == 0 {
         print("ALL VM CHECKS PASSED")
