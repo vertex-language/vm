@@ -543,6 +543,7 @@ func main() async -> int32 {
     checkAndroid()
     checkGoldfishPipe()
     checkGfxstream()
+    await checkQcow2Write()
 
     if failures == 0 {
         print("ALL VM CHECKS PASSED")

@@ -1,5 +1,7 @@
 // Package qcow2 reads and writes QCOW2 images (versions 2 and 3):
 // sparse, copy-on-write, with an optional read-only backing image.
+// Create makes new ones (version 3); WriteCompressed writes deflated
+// clusters, as qemu-img's -c does.
 package qcow2
 
 import (
@@ -27,6 +29,13 @@ public final class Image: disk.Image {
     var l2Cache: [uint64: [uint64]] = [:]
     /// Where the next new cluster goes: the end of the file.
     var nextCluster: uint64
+    /// For writing: the refcount table, and refcount blocks read so far
+    /// (by host offset), as 16-bit counts.
+    var refcountTable: [uint64] = []
+    var refcountBlocks: [uint64: [uint16]] = [:]
+    /// Where the next deflated cluster goes: a byte offset inside the
+    /// last cluster allocated, or 0 for a fresh cluster.
+    var compressedCursor: uint64 = 0
 
     public var Size: uint64 { Header.Size }
 
@@ -181,10 +190,27 @@ public final class Image: disk.Image {
     public func WriteAt(_ offset: uint64, _ bytes: borrowing [uint8]) async throws {
         if ReadOnly { throw disk.DiskError.readOnly(file.Path.Value) }
         try disk.CheckRange(self, offset, uint64(bytes.count))
-        // TODO(P3): allocate L2 tables and data clusters at nextCluster, copy
-        // the untouched part of a cluster from Backing, update refcounts,
-        // write the data, then the L2 entry, then the L1 entry, in that order.
-        throw disk.DiskError.unsupported("QCOW2 writes are not written yet")
+        // Parts of clusters the backing image holds are copied up first
+        // (copy-on-write); the rest is written without waiting.
+        let cs = Header.ClusterSize
+        var done: uint64 = 0
+        let total = uint64(bytes.count)
+        while done < total {
+            let at = offset + done
+            let within = at % cs
+            let n = min(cs - within, total - done)
+            var piece = [uint8](repeating: 0, count: int(n))
+            for i in 0..<int(n) { piece[i] = bytes[int(done) + i] }
+            if n < cs, case .backing = try locate(at) {
+                var cluster = [uint8](repeating: 0, count: int(cs))
+                try await Backing!.ReadAt(at - within, into: &cluster)
+                for i in 0..<int(n) { cluster[int(within) + i] = piece[i] }
+                try storeCluster(at - within, cluster)
+            } else {
+                try write(at, piece)
+            }
+            done += n
+        }
     }
 
     public func Flush() async throws {
@@ -228,5 +254,7 @@ public func Open(_ file: fs.File, readOnly: bool = false,
     }
 
     let end = uint64(try file.Metadata().Size)
-    return Image(file: file, header: h, l1: l1, backing: backing, readOnly: readOnly, end: end)
+    let image = Image(file: file, header: h, l1: l1, backing: backing, readOnly: readOnly, end: end)
+    if !readOnly { try image.loadRefcounts() }
+    return image
 }
