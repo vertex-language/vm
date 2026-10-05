@@ -35,8 +35,9 @@ public struct BootProperties {
     /// it, that EGL is hidden so Android falls back to its software
     /// renderer, which Android 8 can't use for its UI.
     public var HostGpu: bool = false
-    /// Android 9+ has no ramdisk: what would go there goes on the kernel
-    /// command line (CmdlineArgs) or through qemud.
+    /// Android 9+ has no ramdisk the running system reads (9 has none;
+    /// 10's is init's first stage only): what would go there goes on the
+    /// kernel command line (CmdlineArgs) or through qemud.
     public var SystemAsRoot: bool = false
 
     public init() {}
@@ -96,7 +97,8 @@ extension Bundle {
     /// The ramdisk to boot: the image's own, followed by a small cpio
     /// archive of files that replace or add to it — default.prop with
     /// `props` added, and for Ethernet, the feature file and the device's
-    /// init script with dhcpcd added. Linux unpacks concatenated
+    /// init script with dhcpcd added; for Android 10, its first-stage
+    /// fstab with /oem added. Linux unpacks concatenated
     /// initramfs archives in order, so later files replace earlier ones;
     /// the image's file is not changed.
     public func BootRamdisk(_ props: BootProperties) throws -> [uint8] {
@@ -110,7 +112,7 @@ extension Bundle {
             var r = cpio.Reader(io.Cursor(cpioBytes))
             while let h = try r.Next() {
                 let name = h.Name.hasPrefix("./") ? string(h.Name.dropFirst(2)) : h.Name
-                if (name == "default.prop" || name == rc) && h.Kind == cpio.ModeType.regular {
+                if (name == "default.prop" || name == rc || name == firstStageFstab) && h.Kind == cpio.ModeType.regular {
                     files[name] = string(decoding: try r.ReadAll(), as: UTF8.self)
                 }
             }
@@ -129,27 +131,35 @@ extension Bundle {
         func dir(_ name: string) throws {
             try w.WriteHeader(cpio.Header(name: name, mode: cpio.ModeType.directory | 0o755, size: 0))
         }
-        try file("default.prop", text)
-        // Android 8 reads its defaults from /system/etc/prop.default
-        // first (the ramdisk's default.prop only links there), then
-        // /odm/default.prop: the properties go there too.
-        if ApiLevel >= 26 {
-            try dir("odm")
-            try file("odm/default.prop", text)
-        }
-        // Additions to the device's init script.
-        var additions = ""
-        if props.Ethernet {
-            try dir("oem")
-            try dir("oem/etc")
-            try dir("oem/etc/permissions")
-            try file("oem/etc/permissions/android.hardware.ethernet.xml", ethernetFeature)
-            // Android 8 gets its address in Java (IpManager); before, Ethernet runs dhcpcd.
-            if ApiLevel < 26 { additions += dhcpServices }
-        }
-        if ApiLevel >= 26 && !props.HostGpu { additions += hideVendorEgl }
-        if !additions.isEmpty, let script = files[rc] {
-            try file(rc, script + additions, mode: 0o750)
+        if DynamicPartitions {
+            // Android 10's ramdisk is only init's first stage, which
+            // mounts what its fstab says: /oem joins it there.
+            if hasOem(props), let fstab = files[firstStageFstab] {
+                try file(firstStageFstab, (fstab.hasSuffix("\n") ? fstab : fstab + "\n") + oemFstabLine, mode: 0o640)
+            }
+        } else {
+            try file("default.prop", text)
+            // Android 8 reads its defaults from /system/etc/prop.default
+            // first (the ramdisk's default.prop only links there), then
+            // /odm/default.prop: the properties go there too.
+            if ApiLevel >= 26 {
+                try dir("odm")
+                try file("odm/default.prop", text)
+            }
+            // Additions to the device's init script.
+            var additions = ""
+            if props.Ethernet {
+                try dir("oem")
+                try dir("oem/etc")
+                try dir("oem/etc/permissions")
+                try file("oem/etc/permissions/android.hardware.ethernet.xml", ethernetFeature)
+                // Android 8 gets its address in Java (IpManager); before, Ethernet runs dhcpcd.
+                if ApiLevel < 26 { additions += dhcpServices }
+            }
+            if ApiLevel >= 26 && !props.HostGpu { additions += hideVendorEgl }
+            if !additions.isEmpty, let script = files[rc] {
+                try file(rc, script + additions, mode: 0o750)
+            }
         }
         try w.Close()
 

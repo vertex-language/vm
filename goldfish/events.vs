@@ -11,7 +11,7 @@ import (
 /// before 4.x drive it as their only input. It is called "qwerty2", so
 /// Android's /system/usr/idc/qwerty2.idc makes it a touchscreen and a
 /// keyboard, as on the emulator.
-public final class Events: device.Mmio {
+public final class Events: device.Mmio, device.TouchScreen {
     public static let Size: uint64 = 0x1000
 
     // Registers (drivers/input/keyboard/goldfish_events.c).

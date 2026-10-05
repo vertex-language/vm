@@ -140,6 +140,10 @@ public struct Config {
     public var LegacyVirtio: bool = false
     /// Android's first-stage mounts, for its device tree (empty for other guests).
     public var AndroidMounts: [AndroidMount] = []
+    /// Android 10+: the touchscreen and keys are virtio-input (the
+    /// emulator's "virtio_input_multi_touch_1"), not goldfish-events,
+    /// which its kernels no longer drive.
+    public var AndroidVirtioInput: bool = false
 
     public init(cpus: int = 1, memory: uint64 = 1024 << 20) {
         Cpus = cpus

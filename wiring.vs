@@ -104,6 +104,8 @@ public struct WiredDevices {
     /// Android guests: the emulator's screen and its touchscreen and keys.
     public var GoldfishFb: goldfish.Fb? = nil
     public var GoldfishEvents: goldfish.Events? = nil
+    /// Android 10+: its touchscreen and keys on virtio-input.
+    public var AndroidTouch: virtio.Input? = nil
     public var GoldfishBattery: goldfish.Battery? = nil
     public var GoldfishPipe: goldfish.Pipe? = nil
     /// Windows guests: the inbox-driver devices on PCI.
@@ -258,10 +260,21 @@ public func WirePlatform(
         let fb = goldfish.Fb(memory: ram.Memory, irq: irq, width: cfg.Display.Width, height: cfg.Display.Height)
         try wired.MmioBus.Insert(fb, at: device.Range(base: PlatformArm64.GoldfishFbBase, count: PlatformArm64.GoldfishSize))
         wired.GoldfishFb = fb
-        let evIrq = GicIrq(partition: partition, line: PlatformArm64.GoldfishEventsIrq)
-        let events = goldfish.Events(irq: evIrq, width: cfg.Display.Width, height: cfg.Display.Height)
-        try wired.MmioBus.Insert(events, at: device.Range(base: PlatformArm64.GoldfishEventsBase, count: PlatformArm64.GoldfishSize))
-        wired.GoldfishEvents = events
+        if cfg.AndroidVirtioInput {
+            let touch = virtio.Input(touchscreen: "virtio_input_multi_touch_1", width: cfg.Display.Width, height: cfg.Display.Height)
+            let irq = GicIrq(partition: partition, line: PlatformArm64.VirtioIrqBase + uint32(slot))
+            let transport = virtio.MmioTransport(touch, memory: ram.Memory, irq: irq, legacy: cfg.LegacyVirtio)
+            let addr = PlatformArm64.VirtioMmioBase + uint64(slot) * PlatformArm64.VirtioMmioStride
+            try wired.MmioBus.Insert(transport, at: device.Range(base: addr, count: PlatformArm64.VirtioMmioSize))
+            wired.VirtioTransports.append(transport)
+            wired.AndroidTouch = touch
+            slot += 1
+        } else {
+            let evIrq = GicIrq(partition: partition, line: PlatformArm64.GoldfishEventsIrq)
+            let events = goldfish.Events(irq: evIrq, width: cfg.Display.Width, height: cfg.Display.Height)
+            try wired.MmioBus.Insert(events, at: device.Range(base: PlatformArm64.GoldfishEventsBase, count: PlatformArm64.GoldfishSize))
+            wired.GoldfishEvents = events
+        }
     }
 
     // 5. Input devices (keyboard and tablet when display is enabled)

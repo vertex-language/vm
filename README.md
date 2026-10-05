@@ -56,7 +56,7 @@ Zero instruction emulation. Zero QEMU or libvirt dependencies. 100% native CPU a
 | **`vm/nvme`** | **Production** | NVMe 1.4 controller on MSI-X or INTx: admin and I/O queue pairs, Identify, features, log pages, read/write/flush/write zeroes/deallocate, chained PRP lists. Windows' `stornvme` drives it inbox. |
 | **`vm/usb`** | **Production** | xHCI controller with a USB 2.0 root hub: command and event rings, slots and endpoint contexts, control/bulk/interrupt transfers. Devices: HID keyboard and tablet, and bulk-only mass storage as a CD-ROM (SCSI/MMC) or disk. |
 | **`vm/tpm`** | **Production** | TPM 2.0: the TIS / FIFO register interface over MMIO (QEMU's state machine), found by firmware through the DTB (`tcg,tpm-tis-mmio`) and by Windows through ACPI (`MSFT0101` and the `TPM2` table), in front of a `Backend`; today `Swtpm`, the swtpm process over Unix sockets, with its state kept beside the disk. |
-| **`vm/android`** | **Working** | Android emulator system images (Google's AOSP builds, no Google services, pulled with [`vmimage`](../vmimage)): reads a bundle's API level, kernel, ramdisk and disk order, and the kernel command line the emulator's "ranchu" board gives; the qemud boot-properties service. Android 5–9 (API 21–28). |
+| **`vm/android`** | **Working** | Android emulator system images (Google's AOSP builds, no Google services, pulled with [`vmimage`](../vmimage)): reads a bundle's API level, kernel, ramdisk and disk order, and the kernel command line the emulator's "ranchu" board gives; the qemud boot-properties service. Android 5–10 (API 21–29). |
 | **`vm/goldfish`** | **Working** | The Android emulator's board devices: the pipe (v2) with its service registry and qemud framing, the framebuffer, events (touch and keys) and battery. |
 | **`vm/gfxstream`** | **Working** | The host side of the emulator's render protocol: decoders generated from the protocol's spec files (`cmd/gen-gfxstream`), renderControl (configs, contexts, surfaces, color buffers, posting), GLES 2 carried out by `gles`, and recordings that replay without a guest (`cmd/gfxstream-replay`). |
 | **`vm/windows`** | **Production** | Windows ARM64 ISO detection, EDK2 firmware lookup, and the machine configuration Windows installs on. |
@@ -242,7 +242,20 @@ place, as on the emulator, which is why `vmimage --clone` formats it as
 ext4 first ([`fs/ext4`](../fs)). The 4.4 kernel names its goldfish devices
 `google,…`; the device tree lists both names. Not yet: the `refcount` and
 `GLProcessPipe` pipes.
-Android 10 and later are refused (super partition, vbmeta).
+
+Android 10 (API 29, Linux 4.14) boots to its launcher with `--gles`. Its
+system.img is a GPT disk of `vbmeta` and `super`, the dynamic partitions:
+system and vendor are logical partitions in super, which the ramdisk's
+first-stage init maps with dm-linear from super's metadata itself. vm names
+the boot device (`androidboot.boot_devices=a000000.virtio_mmio`, so init
+links `/dev/block/by-name/super`) and passes the verified-boot arguments from
+`VerifiedBootParams.textproto`; vendor.img goes unused. Its kernel has no
+goldfish-events driver: the touchscreen and keys are virtio-input, named
+`virtio_input_multi_touch_1` as the emulator names it (the vendor's idc makes
+it a touchscreen). Its network is Ethernet as on Android 9, `/oem` a third
+partition on the system disk, mounted by a line vm adds to the ramdisk's
+first-stage fstab. Android 11 and later are refused (gfxstream over
+virtio-gpu).
 
 ```bash
 ./vm-run --android testdata/android/api26 --gles --display
@@ -335,8 +348,9 @@ The core microVM engine, direct Linux boot, ISO auto-boot, user-space networking
 - [x] **Drawing on the Mac's GPU** (`gpu/raster`'s Metal path, `shader/msl`).
 - [ ] **GLES 3.0**.
 - [x] **Android 9**: system-as-root, an encrypted userdata, the 4.4 kernel's goldfish device names.
-- [ ] **Android 9's network**: the emulator's virtual Wi-Fi (hostapd in a "router" namespace).
-- [ ] **Android 10 and later**: super partition, verified-boot (vbmeta) arguments, VirtIO PCI.
+- [x] **Android 9's network**: Ethernet, its feature file on an /oem partition vm adds.
+- [x] **Android 10**: dynamic partitions (super), verified-boot (vbmeta) arguments, virtio-input touch.
+- [ ] **Android 11 and later**: gfxstream over virtio-gpu.
 - [ ] **A NIC Windows drives inbox** (e1000e, or the like), for networking in Windows guests.
 - [x] **MSI-X for PCI devices**, through the in-kernel GIC's MSI frame (described in the MADT; there is no ITS).
 - [ ] **x86_64 Hypervisor Wiring**

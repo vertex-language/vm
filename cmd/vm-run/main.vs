@@ -436,7 +436,7 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
             // bar), added to the ramdisk's default.prop.
             bootProps = android.BootProperties.ForScreen(width: displayWidth)
             bootProps.HostGpu = hostGles
-            bootProps.SystemAsRoot = b.SystemAsRoot
+            bootProps.SystemAsRoot = b.NoRamdiskProperties
             if !explicitCmdline { cmdline = b.Cmdline(hostGpu: hostGles, props: bootProps) }
             if !b.SystemAsRoot {
                 initrdPath = b.Ramdisk
@@ -509,6 +509,7 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
             return
         }
         cfg.AndroidMounts = b.FirstStageMounts(bootProps)
+        cfg.AndroidVirtioInput = b.VirtioInput
         cfg.Guest = .android
         // Android can't run without a screen (SurfaceFlinger aborts), so
         // it always has one; --display only decides whether a window shows it.
@@ -637,7 +638,7 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
 
     // A debugging aid for Android's touchscreen without a window:
     // VERTEX_VM_TAP="x,y@seconds;…" taps those screen pixels then.
-    if let taps = env.Get("VERTEX_VM_TAP"), let ev = machine.GoldfishEvents {
+    if let taps = env.Get("VERTEX_VM_TAP"), let ev = machine.AndroidInput {
         for t in taps.split(separator: ";") {
             let parts = t.split(separator: "@")
             let xy = parts.first.map { $0.split(separator: ",") } ?? []
@@ -757,7 +758,7 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
                 w.RequestFrame()
 
             case .pointerMoved(let ptr):
-                if let ev = machine.GoldfishEvents {
+                if let ev = machine.AndroidInput {
                     if ev.Touching, let (x, y) = mapPointerToScreen(ptr.Position) { ev.Touch(x: x, y: y, down: true) }
                     continue
                 }
@@ -766,7 +767,7 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
                 }
 
             case .pointerDown(let ptr, let btn):
-                if let ev = machine.GoldfishEvents {
+                if let ev = machine.AndroidInput {
                     if btn == .secondary {
                         ev.Key(158, pressed: true)   // KEY_BACK
                         ev.Key(158, pressed: false)
@@ -788,7 +789,7 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
                 machine.TabletInput?.Button(button: buttonCode, pressed: true)
 
             case .pointerUp(let ptr, let btn):
-                if let ev = machine.GoldfishEvents {
+                if let ev = machine.AndroidInput {
                     if ev.Touching {
                         let (x, y) = mapPointerToScreen(ptr.Position) ?? (0, 0)
                         ev.Touch(x: x, y: y, down: false)
@@ -834,7 +835,7 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
                 }
 
                 // Android: its keyboard; Home and Escape are its Home and Back keys.
-                if let ev = machine.GoldfishEvents {
+                if let ev = machine.AndroidInput {
                     if k.Code == .home { ev.Key(102, pressed: true) }          // KEY_HOME
                     else if k.Code == .escape { ev.Key(158, pressed: true) }   // KEY_BACK
                     else if let evdev = evdevCodeFor(k.Code), !k.Repeat { ev.Key(evdev, pressed: true) }
@@ -910,7 +911,7 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
                 }
 
             case .keyUp(let k):
-                if let ev = machine.GoldfishEvents {
+                if let ev = machine.AndroidInput {
                     if k.Code == .home { ev.Key(102, pressed: false) }
                     else if k.Code == .escape { ev.Key(158, pressed: false) }
                     else if let evdev = evdevCodeFor(k.Code) { ev.Key(evdev, pressed: false) }
@@ -921,7 +922,7 @@ func readFileBytes(_ path: fs.Path) throws -> [uint8] {
                 }
 
             case .text(let s):
-                if machine.GoldfishEvents != nil { continue }
+                if machine.AndroidInput != nil { continue }
                 if s != "\r" && s != "\n" {
                     machine.ConsoleUart?.Feed([uint8](s.utf8))
                 }

@@ -46,9 +46,24 @@ public struct Bundle {
     /// What Android 8+ mounts in its first stage (the image's
     /// fstab.ranchu.early), for the device tree.
     public let EarlyMounts: [vm.AndroidMount]
-    /// Android 9+: the kernel mounts system.img as the root file system
+    /// Android 9: the kernel mounts system.img as the root file system
     /// and runs its init; there is no ramdisk.
     public let SystemAsRoot: bool
+    /// Android 10: system and vendor are logical partitions in system.img's
+    /// `super` partition, which the ramdisk's first-stage init maps
+    /// (dm-linear) from its metadata, then mounts system as the root.
+    public let DynamicPartitions: bool
+    /// Android 10: the verified-boot arguments the emulator gives
+    /// (VerifiedBootParams.textproto): `androidboot.vbmeta.*`.
+    public let VbmetaArgs: [string]
+
+    /// Android 10+: touch and keys come over virtio-input (its kernels
+    /// have no goldfish-events driver).
+    public var VirtioInput: bool { ApiLevel >= 29 }
+
+    /// What the running system can't read from a ramdisk (Android 9+):
+    /// its settings go on the kernel command line and through qemud.
+    public var NoRamdiskProperties: bool { SystemAsRoot || DynamicPartitions }
 
     /// Reads the bundle in `dir`.
     public static func Open(_ dir: string) throws -> Bundle {
@@ -59,8 +74,8 @@ public struct Bundle {
         let props = properties((try? fs.ReadText(fs.Path(d + "/source.properties"))) ?? "")
         let build = properties((try? fs.ReadText(fs.Path(d + "/build.prop"))) ?? "")
         let api = int(props["AndroidVersion.ApiLevel"] ?? build["ro.build.version.sdk"] ?? "") ?? 0
-        if api >= 29 {
-            throw AndroidError.unsupported(api: api, why: "Android 10 and later boot from a super partition with verified-boot (vbmeta) arguments; vm runs Android 5–9 (API 21–28) so far")
+        if api >= 30 {
+            throw AndroidError.unsupported(api: api, why: "Android 11 and later draw through virtio-gpu rather than the goldfish pipe; vm runs Android 5–10 (API 21–29) so far")
         }
         for f in ["cache.img", "userdata.img"] where !fs.Exists(fs.Path(d + "/" + f)) {
             throw AndroidError.notABundle(d + " (no \(f): make the directory with `vmimage --clone`)")
@@ -68,7 +83,20 @@ public struct Bundle {
         let file = { (name: string) -> Disk in Disk(Path: d + "/" + name, Partition: nil) }
         var disks = [file("system.img"), file("cache.img"), file("userdata.img")]
         var early: [vm.AndroidMount] = []
-        if api >= 28 {
+        var vbmeta: [string] = []
+        if api >= 29 {
+            // Android 10 (the vendor's fstab.ranchu): system.img is a GPT
+            // disk of vbmeta and super, then cache, userdata, the key disk;
+            // vendor.img goes unused (vendor is in super). The ramdisk's
+            // fstab names what its first stage mounts.
+            if !fs.Exists(fs.Path(d + "/encryptionkey.img")) { throw AndroidError.notABundle(d + " (no encryptionkey.img)") }
+            disks = [Disk(Path: d + "/system.img", Partition: "super"), file("cache.img"), file("userdata.img"), file("encryptionkey.img")]
+            let text = (try? fs.ReadText(fs.Path(d + "/VerifiedBootParams.textproto"))) ?? ""
+            for line in text.split(separator: "\n") {
+                let l = string(line).hasSuffix("\r") ? string(line.dropLast()) : string(line)
+                if l.hasPrefix("param: \""), l.hasSuffix("\"") { vbmeta.append(string(l.dropFirst(8).dropLast())) }
+            }
+        } else if api >= 28 {
             // Android 9 (the vendor's fstab.ranchu and the emulator's
             // order): system (the root), cache, userdata, the key disk
             // userdata's encryption keeps its footer on, vendor; vendor
@@ -89,7 +117,7 @@ public struct Bundle {
             early = earlyMounts(ramdiskFiles(d + "/ramdisk.img", ["fstab.ranchu.early"])["fstab.ranchu.early"] ?? "", disks)
         }
         return Bundle(Dir: d, ApiLevel: api, Release: build["ro.build.version.release"] ?? "", Disks: disks, EarlyMounts: early,
-                      SystemAsRoot: api >= 28)
+                      SystemAsRoot: api == 28, DynamicPartitions: api >= 29, VbmetaArgs: vbmeta)
     }
 
     /// The kernel command line the emulator would give this image: the
@@ -97,13 +125,21 @@ public struct Bundle {
     /// rendering (no host GL behind a pipe), SELinux permissive (eng
     /// builds allow it; the policy knows none of vm's devices).
     /// `hostGpu`: the guest draws through the host's renderer (qemu.gles=1).
-    /// Android 9 boots its root from system.img's partition, and reads the
-    /// properties it can't get from a ramdisk here (`props.CmdlineArgs`).
+    /// Android 9 boots its root from system.img's partition; Android 10
+    /// finds super among the partitions of its boot device (vda's
+    /// virtio-mmio device) and checks vbmeta's arguments. Both read the
+    /// properties they can't get from a ramdisk here (`props.CmdlineArgs`).
     public func Cmdline(console: bool = true, hostGpu: bool = false, props: BootProperties = BootProperties()) -> string {
         var c = "androidboot.hardware=ranchu qemu=1 qemu.gles=\(hostGpu ? 1 : 0) androidboot.selinux=permissive"
         if console { c = "console=ttyAMA0,38400 androidboot.console=ttyAMA0 " + c }
         if SystemAsRoot {
             c += " skip_initramfs rootwait ro init=/init root=/dev/vda1"
+        }
+        if DynamicPartitions {
+            c += " androidboot.boot_devices=" + platformDevice(slot: 0)
+            for a in VbmetaArgs { c += " " + a }
+        }
+        if NoRamdiskProperties {
             for a in props.CmdlineArgs { c += " " + a }
         }
         return c
@@ -150,8 +186,13 @@ func earlyMounts(_ fstab: string, _ disks: [Disk]) -> [vm.AndroidMount] {
 
 /// The by-name link init makes for `partition` of the disk in virtio-mmio `slot`.
 func byName(slot: int, partition: string) -> string {
+    return "/dev/block/platform/\(platformDevice(slot: slot))/by-name/\(partition)"
+}
+
+/// The platform device of virtio-mmio `slot`, as Linux names it: "a000000.virtio_mmio".
+func platformDevice(slot: int) -> string {
     let addr = vm.PlatformArm64.VirtioMmioBase + uint64(slot) * vm.PlatformArm64.VirtioMmioStride
-    return "/dev/block/platform/\(string(addr, radix: 16)).virtio_mmio/by-name/\(partition)"
+    return "\(string(addr, radix: 16)).virtio_mmio"
 }
 
 /// `key=value` lines.

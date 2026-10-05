@@ -45,7 +45,13 @@ public final class Machine: PsciController {
     public var ConsoleUart: chipset.Pl011? { Wired.ConsoleUart }
     public var KeyboardInput: virtio.Input? { Wired.KeyboardInput }
     public var TabletInput: virtio.Input? { Wired.TabletInput }
-    /// Android guests' touchscreen and keys.
+    /// Android guests' touchscreen and keys: goldfish-events, or virtio-input on Android 10+.
+    public var AndroidInput: (any device.TouchScreen)? {
+        if let e = Wired.GoldfishEvents { return e }
+        if let t = Wired.AndroidTouch { return t }
+        return nil
+    }
+    /// Android's goldfish-events, where it has them.
     public var GoldfishEvents: goldfish.Events? { Wired.GoldfishEvents }
     /// Android guests' pipe to host services: register them before Start.
     public var GoldfishPipe: goldfish.Pipe? { Wired.GoldfishPipe }

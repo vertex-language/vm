@@ -3,16 +3,25 @@ package virtio
 import (
     "encoding/binary"
     "sync"
+    "vm/device"
 )
 
 /// virtio-input (spec §5.8): evdev events, for Linux guests with a
-/// display. Windows has no inbox driver, so Windows gets usb.Keyboard and
-/// usb.Tablet instead. Queues: event 0, status 1.
-public final class Input: Device {
-    public enum Kind { case keyboard, tablet }
+/// display, and Android 10+'s touchscreen. Windows has no inbox driver, so
+/// Windows gets usb.Keyboard and usb.Tablet instead. Queues: event 0, status 1.
+public final class Input: Device, device.TouchScreen {
+    /// A keyboard; a tablet (absolute pointer, 0–32767); or a touchscreen
+    /// with keys, in screen pixels, as Android reads one.
+    public enum Kind { case keyboard, tablet, touchscreen }
 
     public let Id = DeviceId.input
     public let DeviceKind: Kind
+    /// The touchscreen's name, which picks the guest's input config (Android's
+    /// /vendor/usr/idc/<name>.idc), and its size in pixels.
+    public let Name: string
+    public let Width: int
+    public let Height: int
+    var touching = false
     var queues: [Queue] = []
     var notify: (any Notifier)? = nil
     let lock = sync.Mutex()
@@ -24,6 +33,19 @@ public final class Input: Device {
 
     public init(_ kind: Kind) {
         DeviceKind = kind
+        Name = kind == .tablet ? "Vertex VirtIO Tablet" : "Vertex VirtIO Keyboard"
+        Width = 0
+        Height = 0
+    }
+
+    /// A touchscreen `width` × `height` pixels that also has keys (KEY_ESC
+    /// to KEY_MICMUTE), called `name`: Android 10's emulator calls its
+    /// "virtio_input_multi_touch_1", which its idc makes a touchscreen.
+    public init(touchscreen name: string, width: int, height: int) {
+        DeviceKind = .touchscreen
+        Name = name
+        Width = width
+        Height = height
     }
 
     public var Features: uint64 { CommonFeatures }
@@ -81,13 +103,12 @@ public final class Input: Device {
 
         switch select {
         case 0x01: // VIRTIO_INPUT_CFG_ID_NAME
-            let name = (DeviceKind == .tablet) ? "Vertex VirtIO Tablet" : "Vertex VirtIO Keyboard"
-            let utf8 = [uint8](name.utf8)
+            let utf8 = [uint8](Name.utf8)
             sz = uint8(min(128, utf8.count))
             for i in 0..<int(sz) { bytes[i] = utf8[i] }
 
         case 0x02: // VIRTIO_INPUT_CFG_ID_SERIAL
-            let serial = (DeviceKind == .tablet) ? "vertex-tablet-0" : "vertex-keyboard-0"
+            let serial = DeviceKind == .tablet ? "vertex-tablet-0" : DeviceKind == .touchscreen ? "vertex-touchscreen-0" : "vertex-keyboard-0"
             let utf8 = [uint8](serial.utf8)
             sz = uint8(min(128, utf8.count))
             for i in 0..<int(sz) { bytes[i] = utf8[i] }
@@ -95,12 +116,12 @@ public final class Input: Device {
         case 0x03: // VIRTIO_INPUT_CFG_ID_DEVIDS
             binary.LittleEndian.PutUint16(&bytes, 0x0006, at: 0) // BUS_VIRTUAL
             binary.LittleEndian.PutUint16(&bytes, 0x1af4, at: 2) // Red Hat / VirtIO
-            binary.LittleEndian.PutUint16(&bytes, (DeviceKind == .tablet) ? 0x0002 : 0x0001, at: 4)
+            binary.LittleEndian.PutUint16(&bytes, DeviceKind == .tablet ? 0x0002 : DeviceKind == .touchscreen ? 0x0003 : 0x0001, at: 4)
             binary.LittleEndian.PutUint16(&bytes, 0x0001, at: 6)
             sz = 8
 
         case 0x10: // VIRTIO_INPUT_CFG_PROP_BITS
-            if DeviceKind == .tablet {
+            if DeviceKind != .keyboard {
                 bytes[0] = 0x02 // INPUT_PROP_DIRECT
                 sz = 1
             } else {
@@ -113,7 +134,12 @@ public final class Input: Device {
                 bytes[0] = 0x01 // SYN_REPORT
                 sz = 1
             case 0x01: // EV_KEY
-                if DeviceKind == .tablet {
+                if DeviceKind == .touchscreen {
+                    // KEY_ESC..KEY_MICMUTE (1..248), and BTN_TOUCH (330).
+                    for k in 1...248 { bytes[k / 8] |= uint8(1 << (k % 8)) }
+                    bytes[41] = 0x04
+                    sz = 42
+                } else if DeviceKind == .tablet {
                     // BTN_LEFT (272), BTN_RIGHT (273), BTN_MIDDLE (274) -> byte 34
                     bytes[34] = 0x07
                     // BTN_TOUCH (330) -> byte 41, bit 2
@@ -126,7 +152,7 @@ public final class Input: Device {
                     sz = 32
                 }
             case 0x03: // EV_ABS
-                if DeviceKind == .tablet {
+                if DeviceKind != .keyboard {
                     // ABS_X (0), ABS_Y (1) -> bit 0, 1 -> 0x03
                     bytes[0] = 0x03
                     sz = 1
@@ -138,10 +164,11 @@ public final class Input: Device {
             }
 
         case 0x12: // VIRTIO_INPUT_CFG_ABS_INFO
-            if DeviceKind == .tablet && (subsel == 0 || subsel == 1) {
-                // min = 0, max = 32767
+            if DeviceKind != .keyboard && (subsel == 0 || subsel == 1) {
+                // min = 0, max = 32767 (a touchscreen: its pixels)
+                let maxValue = DeviceKind == .touchscreen ? (subsel == 0 ? Width : Height) - 1 : 32767
                 binary.LittleEndian.PutUint32(&bytes, 0, at: 0)
-                binary.LittleEndian.PutUint32(&bytes, 32767, at: 4)
+                binary.LittleEndian.PutUint32(&bytes, uint32(maxValue), at: 4)
                 binary.LittleEndian.PutUint32(&bytes, 0, at: 8)
                 binary.LittleEndian.PutUint32(&bytes, 0, at: 12)
                 binary.LittleEndian.PutUint32(&bytes, 0, at: 16)
@@ -209,4 +236,24 @@ public final class Input: Device {
         Send(type: 1 /* EV_KEY */, code: code, value: pressed ? 1 : 0)
         Send(type: 0 /* EV_SYN */, code: 0 /* SYN_REPORT */, value: 0)
     }
+
+    /// A key on the touchscreen (device.TouchScreen).
+    public func Key(_ code: uint16, pressed: bool) {
+        Key(code: code, pressed: pressed)
+    }
+
+    /// A finger at (x, y) in the touchscreen's pixels: down, moving, or lifted.
+    public func Touch(x: int, y: int, down: bool) {
+        let was = lock.withLock { touching }
+        if !down && !was { return }
+        Send(type: 3 /* EV_ABS */, code: 0 /* ABS_X */, value: uint32(max(0, min(x, Width - 1))))
+        Send(type: 3 /* EV_ABS */, code: 1 /* ABS_Y */, value: uint32(max(0, min(y, Height - 1))))
+        if down != was {
+            Send(type: 1 /* EV_KEY */, code: 0x14a /* BTN_TOUCH */, value: down ? 1 : 0)
+            lock.withLock { touching = down }
+        }
+        Send(type: 0 /* EV_SYN */, code: 0 /* SYN_REPORT */, value: 0)
+    }
+
+    public var Touching: bool { lock.withLock { touching } }
 }
